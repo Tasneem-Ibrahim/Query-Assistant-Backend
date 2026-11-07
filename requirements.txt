@@ -1,0 +1,20 @@
+# core pipeline
+pymupdf>=1.24            # PDF text + image extraction
+pillow>=10.0             # image handling for OCR
+pytesseract>=0.3.10      # OCR (needs the Tesseract program installed, see README)
+sentence-transformers>=3.0   # embeddings (intfloat/multilingual-e5-small)
+qdrant-client>=1.9       # vector database
+openai>=1.40             # DeepSeek is OpenAI-compatible
+python-dotenv>=1.0
+numpy>=1.26
+
+# chat UI
+streamlit>=1.35
+
+# HTTP API for the Pagewise frontend
+fastapi>=0.115
+uvicorn>=0.30
+python-multipart>=0.0.18
+
+# only for scripts/make_sample_pdfs.py (regenerate the sample PDFs)
+reportlab>=4.0
