@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import shutil
 import threading
 import uuid
 
@@ -173,6 +174,28 @@ def get_domain(key: str) -> Domain:
         return DOMAINS[key]
     except KeyError:
         raise ValueError(f"Unknown domain '{key}'. Choose one of: {', '.join(DOMAINS)}") from None
+
+
+def delete_domain(key: str) -> None:
+    """Remove a custom base and only its own stored documents and vectors."""
+    from . import ingest
+
+    with _domain_lock:
+        custom = _read_custom()
+        if key not in custom:
+            raise ValueError("Only custom knowledge bases can be deleted.")
+        domain = _custom_domain(key, custom[key])
+        pdf_root = config.PDF_DIR.resolve()
+        target = domain.pdf_dir.resolve()
+        if target.parent != pdf_root or target.name != key or domain.pdf_dir.is_symlink():
+            raise ValueError("Knowledge base document path is unsafe.")
+        # Keep the saved name on failure so cleanup can be retried.
+        ingest.reset_domain(key)
+        if target.exists():
+            shutil.rmtree(target)
+        del custom[key]
+        _save_custom(custom)
+        DOMAINS.pop(key, None)
 
 
 def system_prompt(domain: Domain) -> str:

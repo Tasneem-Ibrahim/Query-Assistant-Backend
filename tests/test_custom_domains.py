@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import Mock
 from concurrent.futures import ThreadPoolExecutor
 
 
@@ -84,6 +85,42 @@ class CustomDomainsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.module.create_domain("New")
         self.assertEqual(json.loads(path.read_text()), {"../../escape": "Invalid"})
+
+    def test_delete_removes_only_selected_base_and_its_pdfs(self):
+        selected = self.module.create_domain("Atomic Habit")
+        other = self.module.create_domain("Other topic")
+        for domain in [selected, other]:
+            domain.pdf_dir.mkdir(parents=True)
+            (domain.pdf_dir / "book.pdf").write_bytes(b"fixture")
+        reset = Mock()
+        self.package.ingest = types.SimpleNamespace(reset_domain=reset)
+        self.module.delete_domain(selected.key)
+        reset.assert_called_once_with(selected.key)
+        self.assertFalse(selected.pdf_dir.exists())
+        self.assertTrue((other.pdf_dir / "book.pdf").exists())
+        self.assertNotIn(selected.key, [d.key for d in self.module.list_domains()])
+        with self.assertRaises(ValueError):
+            self.load_module().get_domain(selected.key)
+        self.assertEqual(self.module.get_domain(other.key).label, "Other topic")
+
+    def test_delete_rejects_builtins_and_unknown_keys_without_cleanup(self):
+        reset = Mock()
+        self.package.ingest = types.SimpleNamespace(reset_domain=reset)
+        for key in ["customer_support", "legal_assistant", "../../outside"]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.module.delete_domain(key)
+        reset.assert_not_called()
+
+    def test_delete_vector_failure_keeps_pdfs_and_name_for_retry(self):
+        domain = self.module.create_domain("Atomic Habit")
+        domain.pdf_dir.mkdir(parents=True)
+        pdf = domain.pdf_dir / "book.pdf"
+        pdf.write_bytes(b"fixture")
+        self.package.ingest = types.SimpleNamespace(reset_domain=Mock(side_effect=RuntimeError("offline")))
+        with self.assertRaises(RuntimeError):
+            self.module.delete_domain(domain.key)
+        self.assertTrue(pdf.exists())
+        self.assertEqual(self.load_module().get_domain(domain.key).label, "Atomic Habit")
 
 
 if __name__ == "__main__":

@@ -174,6 +174,8 @@ An ingestion failure produces an `error` event with a `message`. Clients must in
 
 Reset deletes the selected collection and ingestion-registry entries. It keeps the PDF files and custom knowledge-base name; process saved PDFs again to restore searchable content.
 
+To permanently remove a custom knowledge base, select it in the frontend and click **Delete this knowledge base**, then confirm. This deletes only that base's saved PDF folder, vector collection, ingestion records, and saved name. Other bases are preserved. The API endpoint is `DELETE /api/domains/{key}`; built-in assistants cannot be deleted.
+
 ## Storage and project structure
 
 ```text

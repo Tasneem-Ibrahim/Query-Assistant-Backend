@@ -30,7 +30,7 @@ from fastapi.responses import StreamingResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 from rag import answer, config, ingest  # noqa: E402
-from rag.domains import create_domain, get_domain, list_domains, rename_domain  # noqa: E402
+from rag.domains import create_domain, delete_domain, get_domain, list_domains, rename_domain  # noqa: E402
 
 app = FastAPI(title="Query Assistant API", version="1.0")
 
@@ -96,6 +96,16 @@ def update_domain(key: str, body: DomainBody):
         return domain_info(rename_domain(key, body.name))
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/api/domains/{key}")
+def remove_domain(key: str):
+    _domain(key)
+    try:
+        delete_domain(key)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True}
 
 
 @app.get("/api/domains/{key}/status")
