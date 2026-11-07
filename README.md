@@ -176,6 +176,8 @@ Reset deletes the selected collection and ingestion-registry entries. It keeps t
 
 To permanently remove a custom knowledge base, select it in the frontend and click **Delete this knowledge base**, then confirm. This deletes only that base's saved PDF folder, vector collection, ingestion records, and saved name. Other bases are preserved. The API endpoint is `DELETE /api/domains/{key}`; built-in assistants cannot be deleted.
 
+To remove just one PDF from any knowledge base (including Customer Support), click the trash icon beside that document and confirm. Only its saved PDF copies with matching content, vectors in the selected collection, and ingestion entry are removed. Other PDFs and knowledge bases are preserved. The selected base's browser conversation is cleared to avoid showing old citations. The API endpoint is `DELETE /api/domains/{key}/documents/{file_hash}`.
+
 ## Storage and project structure
 
 ```text

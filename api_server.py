@@ -114,6 +114,18 @@ def status(key: str):
     return ingest.status(key)
 
 
+@app.delete("/api/domains/{key}/documents/{file_hash}")
+def remove_document(key: str, file_hash: str):
+    _domain(key)
+    try:
+        ingest.delete_document(key, file_hash)
+    except KeyError as exc:
+        raise HTTPException(404, "Document not found in this knowledge base.") from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True}
+
+
 @app.post("/api/domains/{key}/ask")
 def ask(key: str, body: AskBody):
     domain = _domain(key)

@@ -119,3 +119,28 @@ def reset_domain(domain_key: str) -> None:
     registry = _load_registry()
     registry.pop(domain_key, None)
     _save_registry(registry)
+
+
+def delete_document(domain_key: str, file_hash: str) -> None:
+    """Delete one indexed PDF and its vectors within the selected collection."""
+    domain = get_domain(domain_key)
+    registry = _load_registry()
+    known = registry.get(domain_key, {})
+    if file_hash not in known:
+        raise KeyError("Document not found in this knowledge base.")
+    root = config.PDF_DIR.resolve()
+    directory = domain.pdf_dir.resolve()
+    if directory.parent != root or directory.name != domain.pdf_subdir or domain.pdf_dir.is_symlink():
+        raise ValueError("Unsafe document directory.")
+    # Match content, not just a filename that a later upload may have overwritten.
+    targets = []
+    for pdf in domain.default_pdfs():
+        if pdf.is_symlink() or pdf.resolve().parent != directory:
+            raise ValueError("Unsafe document path.")
+        if extract.file_sha256(pdf) == file_hash:
+            targets.append(pdf)
+    vectorstore.delete_file(domain.collection, file_hash)
+    for pdf in targets:
+        pdf.unlink()
+    del known[file_hash]
+    _save_registry(registry)
