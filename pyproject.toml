@@ -1,2 +1,20 @@
+[project]
+name = "query-assistant-backend"
+version = "1.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "python-multipart>=0.0.18",
+    "python-dotenv>=1.0",
+    "pymupdf>=1.24",
+    "pillow>=10.0",
+    "pytesseract>=0.3.10",
+    "sentence-transformers>=3.0",
+    "qdrant-client>=1.9",
+    "openai>=1.40",
+    "numpy>=1.26",
+]
+
 [tool.vercel]
 entrypoint = "api_server:app"
