@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import atexit
 import hashlib
 import logging
 import uuid
@@ -13,6 +14,16 @@ import pymupdf
 from . import config
 
 
+class CloudStorageError(RuntimeError):
+    """Safe public message for a failed storage dependency."""
+
+
+# Reuse TCP connections across requests; retry only connection establishment.
+_client = httpx.Client(timeout=60, transport=httpx.HTTPTransport(
+    retries=2, limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)))
+atexit.register(_client.close)
+
+
 def _request(method, path, **kwargs):
     if not config.SUPABASE_URL or not config.SUPABASE_SERVICE_ROLE_KEY:
         raise ValueError("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY on the backend.")
@@ -20,12 +31,12 @@ def _request(method, path, **kwargs):
                "Authorization": f"Bearer {config.SUPABASE_SERVICE_ROLE_KEY}"}
     headers.update(kwargs.pop("headers", {}))
     try:
-        response = httpx.request(method, config.SUPABASE_URL + path, headers=headers, timeout=60, **kwargs)
+        response = _client.request(method, config.SUPABASE_URL + path, headers=headers, **kwargs)
     except httpx.HTTPError as exc:
-        raise RuntimeError("Cannot reach Supabase. Check the backend connection and SUPABASE_URL, then retry.") from exc
+        raise CloudStorageError("Cannot reach Supabase. Check the backend connection and SUPABASE_URL, then retry.") from exc
     if not response.is_success:
         # Never pass provider bodies/URLs (which can contain credentials) to browsers.
-        raise RuntimeError(f"Supabase request failed (HTTP {response.status_code}). Check the SQL setup, private bucket and service-role key.")
+        raise CloudStorageError(f"Supabase request failed (HTTP {response.status_code}). Check the SQL setup, private bucket and service-role key.")
     return response
 
 

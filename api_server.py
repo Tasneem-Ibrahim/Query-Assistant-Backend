@@ -26,13 +26,20 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import StreamingResponse  # noqa: E402
+from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 from rag import answer, config, ingest  # noqa: E402
 from rag.domains import create_domain, delete_domain, get_domain, list_domains, rename_domain  # noqa: E402
+from rag.cloud import CloudStorageError  # noqa: E402
 
 app = FastAPI(title="Query Assistant API", version="1.0")
+
+
+@app.exception_handler(CloudStorageError)
+async def storage_error_handler(request, exc):
+    # A handled response passes through CORS so browsers can read the error.
+    return JSONResponse(status_code=502, content={"detail": str(exc)})
 
 # The frontend runs on another port (3000), so allow it. Add your own origin if you deploy it.
 app.add_middleware(
