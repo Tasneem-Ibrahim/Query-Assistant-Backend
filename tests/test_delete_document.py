@@ -3,7 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -74,6 +74,52 @@ class DeleteDocumentTests(unittest.TestCase):
                 ingest.delete_document(self.domain.key, self.hashes[0])
         self.assertTrue(self.first.exists())
         self.assertIn(self.hashes[0], ingest._load_registry()[self.domain.key])
+
+
+class CloudDeleteTests(unittest.TestCase):
+    def test_legacy_collection_is_indexed_before_filtered_deletion(self):
+        client = Mock()
+        schema = {}
+        client.get_collection.return_value.payload_schema = schema
+
+        def create_index(**kwargs):
+            self.assertEqual(kwargs["field_name"], "file_hash")
+            self.assertEqual(kwargs["field_schema"], vectorstore.models.PayloadSchemaType.KEYWORD)
+            self.assertTrue(kwargs["wait"])
+            schema["file_hash"] = Mock()
+
+        def delete(**kwargs):
+            if "file_hash" not in schema:
+                raise RuntimeError("Index required but not found for file_hash")
+            condition = kwargs["points_selector"].filter.must[0]
+            self.assertEqual(condition.key, "file_hash")
+            self.assertEqual(condition.match.value, "target-hash")
+
+        client.create_payload_index.side_effect = create_index
+        client.delete.side_effect = delete
+        with patch.object(config, "QDRANT_URL", "https://qdrant.example"), patch.object(vectorstore, "get_client", return_value=client):
+            vectorstore.delete_file("customer_support", "target-hash")
+            vectorstore.delete_file("customer_support", "target-hash")
+        client.create_payload_index.assert_called_once()
+        self.assertEqual(client.delete.call_count, 2)
+
+    def test_new_cloud_collection_gets_file_hash_index(self):
+        client = Mock()
+        client.collection_exists.return_value = False
+        client.get_collection.return_value.payload_schema = {}
+        with patch.object(config, "QDRANT_URL", "https://qdrant.example"), patch.object(vectorstore, "get_client", return_value=client):
+            vectorstore.ensure_collection("customer_support", 2)
+        client.create_collection.assert_called_once()
+        client.create_payload_index.assert_called_once()
+
+    def test_index_failure_prevents_deletion(self):
+        client = Mock()
+        client.get_collection.return_value.payload_schema = {}
+        client.create_payload_index.side_effect = RuntimeError("Index creation failed")
+        with patch.object(config, "QDRANT_URL", "https://qdrant.example"), patch.object(vectorstore, "get_client", return_value=client):
+            with self.assertRaisesRegex(RuntimeError, "Index creation failed"):
+                vectorstore.delete_file("customer_support", "target-hash")
+        client.delete.assert_not_called()
 
 
 if __name__ == "__main__":

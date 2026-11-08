@@ -46,6 +46,18 @@ def collection_exists(name: str) -> bool:
     return get_client().collection_exists(name)
 
 
+def _ensure_file_hash_index(client: QdrantClient, name: str) -> None:
+    # Cloud strict mode requires an index for filtered deletion. Repair older
+    # collections too; embedded Qdrant does not implement payload indexes.
+    if config.QDRANT_URL and "file_hash" not in client.get_collection(name).payload_schema:
+        client.create_payload_index(
+            collection_name=name,
+            field_name="file_hash",
+            field_schema=models.PayloadSchemaType.KEYWORD,
+            wait=True,
+        )
+
+
 def ensure_collection(name: str, dim: int) -> None:
     client = get_client()
     if not client.collection_exists(name):
@@ -53,6 +65,7 @@ def ensure_collection(name: str, dim: int) -> None:
             collection_name=name,
             vectors_config=models.VectorParams(size=dim, distance=models.Distance.COSINE),
         )
+    _ensure_file_hash_index(client, name)
 
 
 def reset_collection(name: str) -> None:
@@ -79,6 +92,7 @@ def upsert(name: str, chunks: list[dict], vectors: np.ndarray, batch_size: int =
 def delete_file(name: str, file_hash: str) -> None:
     client = get_client()
     if client.collection_exists(name):
+        _ensure_file_hash_index(client, name)
         client.delete(
             collection_name=name,
             points_selector=models.FilterSelector(
