@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BASE_DIR / ".env")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 CLOUD_MODE = os.getenv("STORAGE_BACKEND", "supabase" if os.getenv("VERCEL") else "local") == "supabase"
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")

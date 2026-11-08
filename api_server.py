@@ -32,6 +32,7 @@ from pydantic import BaseModel  # noqa: E402
 from rag import answer, config, ingest  # noqa: E402
 from rag.domains import create_domain, delete_domain, get_domain, list_domains, rename_domain  # noqa: E402
 from rag.cloud import CloudStorageError  # noqa: E402
+from rag import admin_auth  # noqa: E402
 
 app = FastAPI(title="Query Assistant API", version="1.0")
 
@@ -41,7 +42,25 @@ async def storage_error_handler(request, exc):
     # A handled response passes through CORS so browsers can read the error.
     return JSONResponse(status_code=502, content={"detail": str(exc)})
 
-# The frontend runs on another port (3000), so allow it. Add your own origin if you deploy it.
+@app.middleware("http")
+async def require_admin(request, call_next):
+    # Protect every route, including new routes and API documentation.
+    if request.method != "OPTIONS":
+        if not admin_auth.configured():
+            return JSONResponse(status_code=503, content={"detail": "Admin login is not configured. Set ADMIN_PASSWORD on the backend."}, headers={"Cache-Control": "no-store"})
+        if not admin_auth.authorized(request.headers.get("authorization", "")):
+            return JSONResponse(status_code=401, content={"detail": "Admin name or password is incorrect. Please sign in."}, headers={"Cache-Control": "no-store"})
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/api/auth/session")
+def admin_session():
+    return {"name": config.ADMIN_USERNAME}
+
+
+# CORS runs outside authentication so preflight and login errors remain readable.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,

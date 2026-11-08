@@ -271,3 +271,16 @@ The current API is a shared workspace without authentication, per-user authoriza
 ## Repository hygiene
 
 The `.gitignore` excludes environment secrets, virtual environments, caches, runtime databases, and uploaded PDFs. The two bundled sample PDFs and `.env.example` remain versionable. Files already tracked by Git are not removed by adding ignore rules; review staged changes before publishing.
+# Admin access
+
+Set `ADMIN_USERNAME=Admin` and `ADMIN_PASSWORD` in the backend Vercel project's
+Production environment and redeploy. Missing credentials disable all API access
+with HTTP 503. Every route, including health and API documentation, requires
+authentication; browser CORS preflight is allowed without credentials.
+
+The frontend signs in through `/api/auth/session` and sends HTTP Basic credentials
+over HTTPS on every API request. Credentials stay in tab memory only. Reloading
+or signing out requires another login. Changing the backend password invalidates
+the previous credentials after deployment. Never add this password to frontend
+environment variables, JavaScript, or tracked files.
+

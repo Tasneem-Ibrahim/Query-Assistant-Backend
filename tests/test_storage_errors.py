@@ -13,6 +13,14 @@ from rag import cloud, config
 
 
 class StorageErrorTests(unittest.TestCase):
+    def setUp(self):
+        self.auth = patch('api_server.admin_auth.authorized', return_value=True)
+        self.auth.start()
+        self.configured = patch('api_server.admin_auth.configured', return_value=True)
+        self.configured.start()
+        self.addCleanup(self.auth.stop)
+        self.addCleanup(self.configured.stop)
+
     def test_connection_failure_is_safe_json_with_cors(self):
         origin = config.CORS_ORIGINS[0]
         with patch.object(config, 'SUPABASE_URL', 'https://storage.example'), \
