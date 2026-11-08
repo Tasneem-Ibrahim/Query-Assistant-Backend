@@ -107,7 +107,17 @@ def search(name: str, vector: np.ndarray, top_k: int) -> list[dict]:
     client = get_client()
     if not client.collection_exists(name):
         return []
-    response = client.query_points(collection_name=name, query=vector.tolist(), limit=top_k, with_payload=True)
+    query_filter = None
+    if config.CLOUD_MODE:
+        from . import cloud
+        prefix = config.embedding_namespace() + "_"
+        if not name.startswith(prefix):
+            raise ValueError("Cannot query a collection from another embedding configuration.")
+        hashes = list(cloud.list_ingested(name[len(prefix):]))
+        if not hashes:
+            return []
+        query_filter = models.Filter(must=[models.FieldCondition(key="file_hash", match=models.MatchAny(any=hashes))])
+    response = client.query_points(collection_name=name, query=vector.tolist(), limit=top_k, with_payload=True, query_filter=query_filter)
     hits = []
     for point in response.points:
         payload = dict(point.payload or {})

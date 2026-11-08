@@ -1,0 +1,5 @@
+-r requirements.txt
+sentence-transformers>=3.0
+pytesseract>=0.3.10
+streamlit>=1.35
+reportlab>=4.0

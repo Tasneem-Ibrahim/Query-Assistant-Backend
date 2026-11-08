@@ -167,11 +167,15 @@ def _valid(result: dict) -> list[dict] | None:
 
 
 def _load_cache() -> dict:
+    if config.CLOUD_MODE:
+        return {}
     path = config.CACHE_DIR / "llm_cache.json"
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
 def _save_cache(cache: dict) -> None:
+    if config.CLOUD_MODE:
+        return
     (config.CACHE_DIR / "llm_cache.json").write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
 
 

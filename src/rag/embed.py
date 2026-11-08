@@ -9,6 +9,44 @@ from . import config
 _embedder = None
 
 
+class APIEmbedder:
+    """OpenAI-compatible /embeddings endpoint; no local model or torch import."""
+
+    def __init__(self):
+        if not all([config.EMBEDDING_API_URL, config.EMBEDDING_API_KEY, config.EMBEDDING_API_MODEL, config.EMBEDDING_DIMENSIONS]):
+            raise ValueError("Configure EMBEDDING_API_URL, EMBEDDING_API_KEY, EMBEDDING_API_MODEL and EMBEDDING_DIMENSIONS.")
+        self.model_name = config.EMBEDDING_API_MODEL
+        self.dim = config.EMBEDDING_DIMENSIONS
+
+    def _encode(self, texts):
+        import httpx
+
+        batches = []
+        for start in range(0, len(texts), 16):
+            response = httpx.post(config.EMBEDDING_API_URL,
+                headers={"Authorization": f"Bearer {config.EMBEDDING_API_KEY}"},
+                json={"model": self.model_name, "input": texts[start:start + 16]}, timeout=60)
+            if not response.is_success:
+                raise RuntimeError(f"Embedding provider returned HTTP {response.status_code}. Check its configuration and quota.")
+            data = sorted(response.json()["data"], key=lambda item: item["index"])
+            if [item["index"] for item in data] != list(range(len(texts[start:start + 16]))):
+                raise ValueError("Embedding provider returned missing or duplicate vectors.")
+            vectors = np.asarray([item["embedding"] for item in data], dtype="float32")
+            if vectors.shape != (len(data), self.dim) or not np.isfinite(vectors).all():
+                raise ValueError("Embedding dimensions do not match EMBEDDING_DIMENSIONS.")
+            norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+            if (norms == 0).any():
+                raise ValueError("Embedding provider returned an empty vector.")
+            batches.append(vectors / norms)
+        return np.concatenate(batches) if batches else np.empty((0, self.dim), dtype="float32")
+
+    def embed_passages(self, texts):
+        return self._encode(texts)
+
+    def embed_query(self, text):
+        return self._encode([text])[0]
+
+
 class Embedder:
     """multilingual-e5 models need the prefixes 'passage: ' and 'query: ' for best accuracy."""
 
@@ -35,7 +73,7 @@ def get_embedder():
     """Load the model once per process (loading takes a few seconds)."""
     global _embedder
     if _embedder is None:
-        _embedder = Embedder()
+        _embedder = APIEmbedder() if config.EMBEDDING_PROVIDER == "api" else Embedder()
     return _embedder
 
 

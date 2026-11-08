@@ -30,6 +30,9 @@ def _save_registry(registry: dict) -> None:
 
 def list_ingested(domain_key: str) -> dict[str, dict]:
     """{file_hash: {name, pages, chunks, ingested_at}} for one assistant."""
+    if config.CLOUD_MODE:
+        from . import cloud
+        return cloud.list_ingested(domain_key)
     return _load_registry().get(domain_key, {})
 
 
@@ -40,6 +43,12 @@ def is_ingested(domain_key: str, pdf_path: Path) -> bool:
 
 def status(domain_key: str) -> dict:
     domain = get_domain(domain_key)
+    if config.CLOUD_MODE:
+        from . import cloud
+        documents = cloud.documents(domain_key)
+        files = {row["file_hash"]: cloud.report(row) for row in documents if row["status"] == "ready"}
+        return {"domain": domain_key, "chunks": sum(row["chunks"] for row in files.values()),
+                "files": files, "pending_files": {row["file_hash"]: cloud.report(row) for row in documents if row["status"] != "ready"}}
     return {"domain": domain_key, "chunks": vectorstore.count(domain.collection), "files": list_ingested(domain_key)}
 
 
@@ -53,6 +62,8 @@ def ingest_pdf(
 ) -> dict:
     """Ingest one PDF into the domain's collection. Returns a small report dict."""
     domain = get_domain(domain) if isinstance(domain, str) else domain
+    if config.CLOUD_MODE:
+        raise ValueError("Use the cloud HTTP upload and page-step endpoints for Supabase ingestion.")
     pdf_path = Path(pdf_path)
     say = progress or (lambda _m: None)
     config.ensure_dirs()
@@ -115,6 +126,8 @@ def ingest_default_pdfs(domain_key: str, **kwargs) -> list[dict]:
 def reset_domain(domain_key: str) -> None:
     """Delete the collection and forget its files (the PDFs themselves are not touched)."""
     domain = get_domain(domain_key)
+    if config.CLOUD_MODE:
+        raise ValueError("In cloud mode, delete individual PDFs and upload again to rebuild. Reset is disabled to protect resumable jobs.")
     vectorstore.reset_collection(domain.collection)
     registry = _load_registry()
     registry.pop(domain_key, None)
@@ -124,6 +137,10 @@ def reset_domain(domain_key: str) -> None:
 def delete_document(domain_key: str, file_hash: str) -> None:
     """Delete one indexed PDF and its vectors within the selected collection."""
     domain = get_domain(domain_key)
+    if config.CLOUD_MODE:
+        from . import cloud
+        cloud.delete_document(domain, file_hash)
+        return
     registry = _load_registry()
     known = registry.get(domain_key, {})
     if file_hash not in known:

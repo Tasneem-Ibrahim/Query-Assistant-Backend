@@ -37,7 +37,7 @@ app = FastAPI(title="Query Assistant API", version="1.0")
 # The frontend runs on another port (3000), so allow it. Add your own origin if you deploy it.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=config.CORS_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -73,7 +73,9 @@ class SearchBody(BaseModel):
 # --------------------------------------------------------------------------- #
 @app.get("/api/health")
 def health():
-    return {"ok": True, "deepseek_key": bool(config.DEEPSEEK_API_KEY), "qdrant": "server" if config.QDRANT_URL else "local"}
+    errors = config.configuration_errors()
+    return {"ok": not errors, "configuration_errors": errors, "storage": "supabase" if config.CLOUD_MODE else "local",
+            "deepseek_key": bool(config.DEEPSEEK_API_KEY), "qdrant": "server" if config.QDRANT_URL else "local"}
 
 
 @app.get("/api/domains")
@@ -149,6 +151,8 @@ def search(key: str, body: SearchBody):
 @app.post("/api/domains/{key}/reset")
 def reset(key: str):
     _domain(key)
+    if config.CLOUD_MODE:
+        raise HTTPException(400, "Delete individual PDFs and upload again to rebuild this cloud knowledge base.")
     ingest.reset_domain(key)
     return {"ok": True}
 
@@ -168,6 +172,27 @@ async def ingest_endpoint(
       {"type": "error", "message": "..."}
     """
     domain = _domain(key)
+
+    if config.CLOUD_MODE:
+        from rag import cloud
+        try:
+            if file is not None and file.filename:
+                if not file.filename.lower().endswith(".pdf"):
+                    raise HTTPException(400, "Only PDF files are supported.")
+                content = await file.read(config.MAX_UPLOAD_BYTES + 1)
+                if not content or len(content) > config.MAX_UPLOAD_BYTES:
+                    raise HTTPException(413, "Choose a non-empty PDF smaller than 4 MB. Split larger PDFs into smaller files.")
+                name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename)
+                return {"jobs": [cloud.start(domain, name, content, use_llm=use_llm, force=force)]}
+            jobs = [{"file_hash": row["file_hash"], "status": row["status"]}
+                    for row in cloud.documents(key) if row["status"] != "ready"]
+            if not jobs:
+                raise HTTPException(404, "No pending saved PDFs. Upload a PDF to this cloud knowledge base.")
+            return {"jobs": jobs}
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(502, str(exc)) from exc
 
     targets: list[Path]
     if file is not None and file.filename:
@@ -208,3 +233,18 @@ async def ingest_endpoint(
             yield json.dumps(item, ensure_ascii=False) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.post("/api/domains/{key}/documents/{file_hash}/step")
+def process_page(key: str, file_hash: str):
+    if not config.CLOUD_MODE:
+        raise HTTPException(404, "Page jobs are only available in Supabase mode.")
+    if not re.fullmatch(r"[a-f0-9]{64}", file_hash):
+        raise HTTPException(400, "Invalid document identifier.")
+    from rag import cloud
+    try:
+        return cloud.step(_domain(key), file_hash)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc

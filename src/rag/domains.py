@@ -3,7 +3,7 @@ and its own answering style."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import shutil
 import threading
@@ -106,6 +106,9 @@ def _custom_path():
 
 
 def _read_custom() -> dict[str, str]:
+    if getattr(config, "CLOUD_MODE", False):
+        from . import cloud
+        return {row["key"]: row["label"] for row in cloud.rows("qa_domains", order="key.asc")}
     path = _custom_path()
     if not path.exists():
         return {}
@@ -130,9 +133,16 @@ def _save_custom(data: dict[str, str]) -> None:
 
 def list_domains() -> list[Domain]:
     with _domain_lock:
-        for key, label in _read_custom().items():
+        custom = _read_custom()
+        for key in list(DOMAINS):
+            if key not in _BUILTIN_KEYS and key not in custom:
+                DOMAINS.pop(key)
+        for key, label in custom.items():
             DOMAINS[key] = _custom_domain(key, label)
-        return list(DOMAINS.values())
+        domains = list(DOMAINS.values())
+        if getattr(config, "CLOUD_MODE", False):
+            domains = [replace(domain, collection=f"{config.embedding_namespace()}_{domain.key}") for domain in domains]
+        return domains
 
 
 def _validate_label(label: str, custom: dict[str, str], excluding: str | None = None) -> str:
@@ -152,9 +162,13 @@ def create_domain(label: str) -> Domain:
         label = _validate_label(label, custom)
         key = "custom_" + uuid.uuid4().hex
         custom[key] = label
-        _save_custom(custom)
+        if getattr(config, "CLOUD_MODE", False):
+            from . import cloud
+            cloud.write("qa_domains", {"key": key, "label": label}, "key")
+        else:
+            _save_custom(custom)
         DOMAINS[key] = _custom_domain(key, label)
-        return DOMAINS[key]
+        return get_domain(key)
 
 
 def rename_domain(key: str, label: str) -> Domain:
@@ -163,15 +177,19 @@ def rename_domain(key: str, label: str) -> Domain:
         if key not in custom:
             raise ValueError("Only custom knowledge bases can be renamed.")
         custom[key] = _validate_label(label, custom, excluding=key)
-        _save_custom(custom)
+        if getattr(config, "CLOUD_MODE", False):
+            from . import cloud
+            cloud.write("qa_domains", {"key": key, "label": custom[key]}, "key")
+        else:
+            _save_custom(custom)
         DOMAINS[key] = _custom_domain(key, custom[key])
-        return DOMAINS[key]
+        return get_domain(key)
 
 
 def get_domain(key: str) -> Domain:
-    list_domains()
+    available = {domain.key: domain for domain in list_domains()}
     try:
-        return DOMAINS[key]
+        return available[key]
     except KeyError:
         raise ValueError(f"Unknown domain '{key}'. Choose one of: {', '.join(DOMAINS)}") from None
 
@@ -184,6 +202,18 @@ def delete_domain(key: str) -> None:
         custom = _read_custom()
         if key not in custom:
             raise ValueError("Only custom knowledge bases can be deleted.")
+        if getattr(config, "CLOUD_MODE", False):
+            from . import cloud, vectorstore
+            domain = get_domain(key)
+            for row in cloud.documents(key):
+                cloud.delete_document(domain, row["file_hash"])
+            vectorstore.reset_collection(domain.collection)
+            # Keep the name while any other embedding namespace still has documents.
+            if cloud.rows("qa_documents", domain="eq." + key):
+                raise ValueError("This base also has documents in another embedding configuration. Remove those before deleting its name.")
+            cloud.remove("qa_domains", key="eq." + key)
+            DOMAINS.pop(key, None)
+            return
         domain = _custom_domain(key, custom[key])
         pdf_root = config.PDF_DIR.resolve()
         target = domain.pdf_dir.resolve()

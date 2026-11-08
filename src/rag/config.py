@@ -4,16 +4,51 @@ from __future__ import annotations
 
 import os
 import shutil
+import hashlib
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BASE_DIR / ".env")
+CLOUD_MODE = os.getenv("STORAGE_BACKEND", "supabase" if os.getenv("VERCEL") else "local") == "supabase"
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "knowledge-pdfs")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "api" if CLOUD_MODE else "local")
+EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "")
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
+EMBEDDING_API_MODEL = os.getenv("EMBEDDING_API_MODEL", "")
+EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "0") or "0")
+OCR_API_URL = os.getenv("OCR_API_URL", "https://api.mistral.ai/v1/ocr")
+OCR_API_KEY = os.getenv("OCR_API_KEY", "")
+OCR_API_MODEL = os.getenv("OCR_API_MODEL", "mistral-ocr-latest")
+CORS_ORIGINS = [value.strip() for value in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if value.strip()]
+MAX_UPLOAD_BYTES = 4_000_000  # Leave room for multipart headers below Vercel's request limit.
+
+
+def embedding_namespace() -> str:
+    identity = f"{EMBEDDING_API_URL}|{EMBEDDING_API_MODEL}|{EMBEDDING_DIMENSIONS}"
+    return "api_" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+
+
+def configuration_errors() -> list[str]:
+    required = {}
+    if CLOUD_MODE:
+        required.update(SUPABASE_URL=SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY=SUPABASE_SERVICE_ROLE_KEY, QDRANT_URL=QDRANT_URL)
+        if EMBEDDING_PROVIDER != "api":
+            return ["Cloud mode requires EMBEDDING_PROVIDER=api"]
+    if EMBEDDING_PROVIDER == "api":
+        required.update(EMBEDDING_API_URL=EMBEDDING_API_URL, EMBEDDING_API_KEY=EMBEDDING_API_KEY, EMBEDDING_API_MODEL=EMBEDDING_API_MODEL, EMBEDDING_DIMENSIONS=EMBEDDING_DIMENSIONS)
+    errors = [f"Set {key}" for key, value in required.items() if not value]
+    if EMBEDDING_PROVIDER == "api" and EMBEDDING_DIMENSIONS < 0:
+        errors.append("EMBEDDING_DIMENSIONS must be positive")
+    return errors
 
 # ---- folders -------------------------------------------------------------- #
 PDF_DIR = BASE_DIR / "pdfs"
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(tempfile.gettempdir()) / "query-assistant" if CLOUD_MODE else BASE_DIR / "data"
 CACHE_DIR = DATA_DIR / "cache"          # extraction + LLM cache (saves time and money)
 REGISTRY_FILE = DATA_DIR / "registry.json"  # which PDFs are already vectorised
 QDRANT_PATH = DATA_DIR / "qdrant_db"    # local Qdrant storage (no server needed)

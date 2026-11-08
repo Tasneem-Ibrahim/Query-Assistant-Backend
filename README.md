@@ -1,5 +1,8 @@
 # Query Assistant | Backend
 
+For the lightweight Vercel + Supabase deployment, follow [DEPLOY_VERCEL.md](DEPLOY_VERCEL.md).
+The instructions below describe local mode; install `requirements-local.txt` for local embeddings/OCR/Streamlit.
+
 An OCR-enabled retrieval-augmented generation (RAG) backend for asking questions about PDFs with document-level isolation and page citations.
 
 The pipeline extracts text and image content, cleans it, creates page-aware passages, and stores embeddings in Qdrant. Questions retrieve relevant passages before DeepSeek generates a grounded answer.
