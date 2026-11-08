@@ -71,6 +71,7 @@ class SearchBody(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+@app.get("/")
 @app.get("/api/health")
 def health():
     errors = config.configuration_errors()
