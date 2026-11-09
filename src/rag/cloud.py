@@ -87,10 +87,42 @@ def _object_path(path):
     return "/storage/v1/object/" + quote(config.SUPABASE_BUCKET, safe="") + "/" + quote(path, safe="/")
 
 
+def _save_image_text(object_path, text, page=1):
+    """Keep exact UTF-8 OCR in a PDF attachment; the bucket accepts PDFs only."""
+    previous = _request("GET", _object_path(object_path + ".ocr.pdf")).content if page > 1 else None
+    attachments = {}
+    if previous:
+        with pymupdf.open(stream=previous, filetype="pdf") as saved:
+            attachments = {name: saved.embfile_get(name) for name in saved.embfile_names()}
+    attachments[f"ocr-{page:04d}.txt"] = text.encode("utf-8")
+    with pymupdf.open() as preview:
+        preview.new_page()
+        for name, data in sorted(attachments.items()):
+            preview.embfile_add(name, data)
+        content = preview.tobytes()
+    _request("POST", _object_path(object_path + ".ocr.pdf"), content=content,
+             headers={"Content-Type": "application/pdf", "x-upsert": "true"})
+
+
+def read_image_text(object_path):
+    response = _request("GET", _object_path(object_path + ".ocr.pdf"))
+    try:
+        with pymupdf.open(stream=response.content, filetype="pdf") as preview:
+            names = sorted(name for name in preview.embfile_names() if name.startswith("ocr-") and name.endswith(".txt"))
+            if not names:
+                return preview.embfile_get("ocr.txt").decode("utf-8")
+            texts = [preview.embfile_get(name).decode("utf-8") for name in names]
+            return "\n\n".join(f"Page {index}\n{text}" for index, text in enumerate(texts, 1)) if len(texts) > 1 else texts[0]
+    except (ValueError, RuntimeError, UnicodeError) as exc:
+        raise CloudStorageError("Saved OCR preview is unreadable. Reprocess this image.") from exc
+
+
 def start(domain, name, content, use_llm=True, force=False):
     errors = config.configuration_errors()
     if errors:
         raise ValueError("; ".join(errors))
+    from .extract import document_pdf
+    normalized = document_pdf(name, content)
     digest = hashlib.sha256(content).hexdigest()
     existing = next((row for row in documents(domain.key) if row["file_hash"] == digest), None)
     if existing:
@@ -98,14 +130,14 @@ def start(domain, name, content, use_llm=True, force=False):
             raise ValueError("Delete this document first, then upload it again to rebuild it.")
         return {"file_hash": digest, "status": existing["status"], "report": report(existing)}
     try:
-        with pymupdf.open(stream=content, filetype="pdf") as pdf:
+        with pymupdf.open(stream=normalized, filetype="pdf") as pdf:
             if pdf.is_encrypted or not 1 <= len(pdf) <= 500:
                 raise ValueError("Use an unlocked PDF with 1–500 pages.")
             pages = len(pdf)
     except (pymupdf.FileDataError, pymupdf.EmptyFileError) as exc:
         raise ValueError("This file is not a readable PDF.") from exc
     path = f"{config.embedding_namespace()}/{domain.key}/{digest}.pdf"
-    _request("POST", _object_path(path), content=content,
+    _request("POST", _object_path(path), content=normalized,
              headers={"Content-Type": "application/pdf", "x-upsert": "true"})
     row = {"namespace": config.embedding_namespace(), "domain": domain.key,
            "file_hash": digest, "name": name, "object_path": path, "pages": pages,
@@ -117,8 +149,19 @@ def start(domain, name, content, use_llm=True, force=False):
 
 
 def _ocr_page(pdf, page_index):
+    import os
+    if os.getenv("OCR_PROVIDER", "api") == "tesseract":
+        from .extract import ocr_image
+        from PIL import Image
+        import io
+        pix = pdf[page_index].get_pixmap(dpi=200)
+        with Image.open(io.BytesIO(pix.tobytes("png"))) as img:
+            text = ocr_image(img, psm=3)
+        if not text.strip():
+            raise ValueError("No readable text found on this page. Use a clearer scan or image.")
+        return text
     if not config.OCR_API_KEY:
-        raise ValueError("This page needs OCR. Set OCR_API_KEY for the configured Mistral-compatible OCR endpoint, then resume processing.")
+        raise ValueError("This page needs OCR. Set OCR_API_KEY for cloud OCR, or set OCR_PROVIDER=tesseract on a backend with Tesseract installed, then resume processing.")
     with pymupdf.open() as single:
         single.insert_pdf(pdf, from_page=page_index, to_page=page_index)
         data = base64.b64encode(single.tobytes()).decode()
@@ -156,6 +199,10 @@ def step(domain, digest):
                 image = bool(page.get_images()) or not page.get_text().strip()
                 # OCR the whole page once, avoiding duplicate text/image extraction.
                 text = _ocr_page(pdf, index) if image else page.get_text().strip()
+            from .extract import IMAGE_EXTENSIONS
+            from pathlib import Path
+            if Path(row["name"]).suffix.lower() in IMAGE_EXTENSIONS:
+                _save_image_text(row["object_path"], text, page=index + 1)
             raw = {"page": index + 1, "text": text, "image_text": [], "is_image": image}
             cleaned = clean.clean_pages([raw], use_llm=row["use_llm"])
             chunks = chunk.chunk_pages(cleaned, domain.key, row["name"], digest)
@@ -196,7 +243,7 @@ def delete_document(domain, digest):
     try:
         vectorstore.delete_file(domain.collection, digest)
         # Namespace-qualified object keys allow another embedding version to coexist.
-        _request("DELETE", "/storage/v1/object/" + quote(config.SUPABASE_BUCKET, safe=""), json={"prefixes": [found["object_path"]]})
+        _request("DELETE", "/storage/v1/object/" + quote(config.SUPABASE_BUCKET, safe=""), json={"prefixes": [found["object_path"], found["object_path"] + ".ocr.pdf", found["object_path"] + ".ocr.txt"]})
         remove("qa_documents", **scope(domain.key), file_hash="eq." + digest, lease_token="eq." + token)
     finally:
         _release(args)

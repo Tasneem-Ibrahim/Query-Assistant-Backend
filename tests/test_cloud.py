@@ -17,6 +17,9 @@ from rag.domains import Domain
 
 class CloudPipelineTests(unittest.TestCase):
     def setUp(self):
+        provider = patch.dict("os.environ", {"OCR_PROVIDER": "api"})
+        provider.start()
+        self.addCleanup(provider.stop)
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         vectorstore.close_client()
@@ -52,6 +55,10 @@ class CloudPipelineTests(unittest.TestCase):
         data = kwargs.get("json", {})
         if path.startswith("/storage/v1/object/"):
             if method == "POST":
+                # Match the production bucket's PDF-only MIME restriction.
+                self.assertEqual(kwargs["headers"]["Content-Type"], "application/pdf")
+                with pymupdf.open(stream=kwargs["content"], filetype="pdf") as pdf:
+                    self.assertGreaterEqual(len(pdf), 1)
                 self.objects[path] = kwargs["content"]
             if method == "GET":
                 return httpx.Response(200, content=self.objects[path])
@@ -99,6 +106,50 @@ class CloudPipelineTests(unittest.TestCase):
         self.assertEqual(len(vectorstore.search(self.domain.collection, np.array([1., 0.]), 10)), 2)
         cloud.step(self.domain, digest)  # Completed jobs do not re-embed or duplicate counts.
         self.assertEqual(self.fake_embedder.embed_passages.call_count, 2)
+
+    def test_image_upload_indexes_original_filename(self):
+        import io
+        from PIL import Image
+        buffer = io.BytesIO()
+        Image.new("RGB", (600, 400), "white").save(buffer, format="PNG")
+        digest = cloud.start(self.domain, "returns.png", buffer.getvalue(), use_llm=False)["file_hash"]
+        with patch.object(cloud, "_ocr_page", return_value="Returns are accepted within thirty days."):
+            result = cloud.step(self.domain, digest)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["report"]["pages"], 1)
+        self.assertEqual(result["report"]["name"], "returns.png")
+        self.assertEqual(cloud.read_image_text(self.row["object_path"]), "Returns are accepted within thirty days.")
+        hits = vectorstore.search(self.domain.collection, np.array([1., 0.]), 10)
+        self.assertTrue(any("thirty days" in hit["text"] for hit in hits))
+
+    def test_preview_preserves_unicode_and_lines_in_pdf_only_bucket(self):
+        text = "English and اردو\n<original OCR text>\nSecond line."
+        cloud._save_image_text("sample.pdf", text)
+        self.assertEqual(cloud.read_image_text("sample.pdf"), text)
+        self.assertIn(cloud._object_path("sample.pdf.ocr.pdf"), self.objects)
+
+    def test_multipage_preview_retry_keeps_each_page_once(self):
+        cloud._save_image_text("scan.pdf", "First page", page=1)
+        cloud._save_image_text("scan.pdf", "Second page", page=2)
+        cloud._save_image_text("scan.pdf", "Second page", page=2)
+        text = cloud.read_image_text("scan.pdf")
+        self.assertEqual(text, "Page 1\nFirst page\n\nPage 2\nSecond page")
+
+    def test_multipage_tiff_cloud_processing_keeps_both_pages(self):
+        import io
+        from PIL import Image
+        buffer = io.BytesIO()
+        first = Image.new("RGB", (400, 200), "white")
+        first.save(buffer, format="TIFF", save_all=True, append_images=[first.copy()])
+        digest = cloud.start(self.domain, "scan.tiff", buffer.getvalue(), use_llm=False)["file_hash"]
+        with patch.object(cloud, "_ocr_page", side_effect=["First page accepts returns.", "Second page covers delivery."]):
+            self.assertEqual(cloud.step(self.domain, digest)["status"], "pending")
+            result = cloud.step(self.domain, digest)
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["report"]["pages"], 2)
+        text = cloud.read_image_text(self.row["object_path"])
+        self.assertIn("First page accepts returns.", text)
+        self.assertIn("Second page covers delivery.", text)
 
     def test_retry_after_partial_upsert_keeps_cached_chunks_and_counts(self):
         digest = self.upload()
@@ -191,7 +242,12 @@ class CloudAPITests(unittest.TestCase):
         import api_server
 
         self.server = api_server
-        self.client = TestClient(api_server.app)
+        import base64
+        auth_settings = patch.multiple(config, ADMIN_USERNAME="Admin", ADMIN_PASSWORD="test-password")
+        auth_settings.start()
+        self.addCleanup(auth_settings.stop)
+        token = base64.b64encode(b"Admin:test-password").decode()
+        self.client = TestClient(api_server.app, headers={"Authorization": "Basic " + token})
         self.cloud_mode = patch.object(config, "CLOUD_MODE", True)
         self.cloud_mode.start()
         self.domain_patch = patch.object(api_server, "get_domain", return_value=Mock(key="customer_support"))
@@ -207,6 +263,12 @@ class CloudAPITests(unittest.TestCase):
             response = self.client.post("/api/domains/customer_support/ingest", files={"file": ("guide.pdf", b"fixture", "application/pdf")})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["jobs"][0]["status"], "pending")
+
+    def test_image_upload_uses_the_same_endpoint(self):
+        with patch.object(cloud, "start", return_value={"file_hash": "b" * 64, "status": "pending"}) as start:
+            response = self.client.post("/api/domains/customer_support/ingest", files={"file": ("notes.PNG", b"fixture", "image/png")})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(start.call_args.args[1], "notes.PNG")
 
     def test_oversized_upload_is_rejected_before_storage(self):
         with patch.object(cloud, "start") as start:

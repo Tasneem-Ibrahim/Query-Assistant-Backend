@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-from rag import answer, config, ingest  # noqa: E402
+from rag import answer, config, ingest, extract  # noqa: E402
 from rag.domains import create_domain, delete_domain, get_domain, list_domains, rename_domain  # noqa: E402
 from rag.cloud import CloudStorageError  # noqa: E402
 from rag import admin_auth  # noqa: E402
@@ -204,11 +204,11 @@ async def ingest_endpoint(
         from rag import cloud
         try:
             if file is not None and file.filename:
-                if not file.filename.lower().endswith(".pdf"):
-                    raise HTTPException(400, "Only PDF files are supported.")
+                if Path(file.filename).suffix.lower() not in extract.SUPPORTED_EXTENSIONS:
+                    raise HTTPException(400, "Choose a PDF, JPG, JPEG, PNG, JFIF, WebP, BMP, TIF, TIFF or AVIF file.")
                 content = await file.read(config.MAX_UPLOAD_BYTES + 1)
                 if not content or len(content) > config.MAX_UPLOAD_BYTES:
-                    raise HTTPException(413, "Choose a non-empty PDF smaller than 4 MB. Split larger PDFs into smaller files.")
+                    raise HTTPException(413, "Choose a non-empty PDF or image smaller than 4 MB.")
                 name = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename)
                 return {"jobs": [cloud.start(domain, name, content, use_llm=use_llm, force=force)]}
             jobs = [{"file_hash": row["file_hash"], "status": row["status"]}
@@ -225,10 +225,17 @@ async def ingest_endpoint(
     if file is not None and file.filename:
         domain.pdf_dir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename)
-        if not safe.lower().endswith(".pdf"):
-            raise HTTPException(400, "Only PDF files are supported.")
+        if Path(safe).suffix.lower() not in extract.SUPPORTED_EXTENSIONS:
+            raise HTTPException(400, "Choose a PDF, JPG, JPEG, PNG, JFIF, WebP, BMP, TIF, TIFF or AVIF file.")
         target = domain.pdf_dir / safe
-        target.write_bytes(await file.read())
+        content = await file.read(config.MAX_UPLOAD_BYTES + 1)
+        if len(content) > config.MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "Choose a document smaller than 4 MB.")
+        try:
+            extract.document_pdf(safe, content)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        target.write_bytes(content)
         targets = [target]
     else:
         targets = domain.default_pdfs()
@@ -260,6 +267,42 @@ async def ingest_endpoint(
             yield json.dumps(item, ensure_ascii=False) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.get("/api/domains/{key}/documents/{file_hash}/text")
+def image_text(key: str, file_hash: str):
+    domain = _domain(key)
+    if not re.fullmatch(r"[a-f0-9]{64}", file_hash):
+        raise HTTPException(400, "Invalid document identifier.")
+    if config.CLOUD_MODE:
+        from rag import cloud
+        row = next((row for row in cloud.documents(key) if row["file_hash"] == file_hash), None)
+        if not row:
+            raise HTTPException(404, "Document not found in this knowledge base.")
+        if Path(row["name"]).suffix.lower() not in extract.IMAGE_EXTENSIONS or row["status"] != "ready":
+            raise HTTPException(400, "Process an image first to view its extracted text.")
+        try:
+            text = cloud.read_image_text(row["object_path"])
+        except CloudStorageError as exc:
+            raise HTTPException(404, "Extracted text is unavailable. For older images, delete and upload the image again. If storage is unavailable, retry shortly.") from exc
+        return {"name": row["name"], "text": text}
+    row = ingest.list_ingested(key).get(file_hash)
+    if not row:
+        raise HTTPException(404, "Document not found in this knowledge base.")
+    if Path(row["name"]).suffix.lower() not in extract.IMAGE_EXTENSIONS:
+        raise HTTPException(400, "Extracted text preview is available for images.")
+    text = row.get("extracted_text")
+    if text is None:
+        # Older indexed images can be previewed without rebuilding their vectors.
+        path = next((p for p in domain.default_pdfs() if extract.file_sha256(p) == file_hash), None)
+        if path is None:
+            raise HTTPException(404, "The original image is unavailable. Upload the image again.")
+        try:
+            pages = extract.extract_pdf(path)
+            text = "\n\n".join(t for page in pages for t in page["image_text"])
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+    return {"name": row["name"], "text": text}
 
 
 @app.post("/api/domains/{key}/documents/{file_hash}/step")

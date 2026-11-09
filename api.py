@@ -11,7 +11,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-from rag import answer, ingest  # noqa: E402
+from rag import answer, ingest, extract, config  # noqa: E402
 from rag.domains import DOMAINS  # noqa: E402
 
 app = FastAPI(title="Query Assistant API")
@@ -47,7 +47,14 @@ def ingest_pdf(key: str, file: UploadFile | None = File(None)):
     if file is not None:
         domain.pdf_dir.mkdir(parents=True, exist_ok=True)
         target = domain.pdf_dir / re.sub(r"[^A-Za-z0-9._-]+", "_", file.filename or "upload.pdf")
-        target.write_bytes(file.file.read())
+        content = file.file.read(config.MAX_UPLOAD_BYTES + 1)
+        if len(content) > config.MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "Choose a document smaller than 4 MB.")
+        try:
+            extract.document_pdf(target.name, content)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        target.write_bytes(content)
         pdfs = [target]
     else:
         pdfs = domain.default_pdfs()

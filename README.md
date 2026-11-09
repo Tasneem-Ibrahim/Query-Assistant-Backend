@@ -1,286 +1,372 @@
 # Query Assistant | Backend
 
-For the lightweight Vercel + Supabase deployment, follow [DEPLOY_VERCEL.md](DEPLOY_VERCEL.md).
-The instructions below describe local mode; install `requirements-local.txt` for local embeddings/OCR/Streamlit.
+Query Assistant helps users find and understand information stored in <span style="color: #8ecbff;"><strong>PDFs, scanned documents and images</strong></span> by asking questions in <span style="color: #8ecbff;"><strong>natural language</strong></span>. It extracts readable text, recognizes image text through <span style="color: #8ecbff;"><strong>OCR</strong></span>, organizes the content into a <span style="color: #8ecbff;"><strong>searchable knowledge base</strong></span> and retrieves relevant passages to generate answers with <span style="color: #8ecbff;"><strong>document and page references</strong></span>. The project can support <span style="color: #8ecbff;"><strong>customer-service teams</strong></span> searching policies, <span style="color: #8ecbff;"><strong>students</strong></span> reviewing study notes, <span style="color: #8ecbff;"><strong>researchers</strong></span> exploring reports and users locating clauses in legal documents. By keeping related documents in separate knowledge bases and showing both extracted text and <span style="color: #8ecbff;"><strong>supporting sources</strong></span>, it reduces manual searching and makes the information behind an answer easier to inspect.
 
-An OCR-enabled retrieval-augmented generation (RAG) backend for asking questions about PDFs with document-level isolation and page citations.
+**Turn PDFs and images into searchable knowledge, then answer questions with document and page citations.**
 
-The pipeline extracts text and image content, cleans it, creates page-aware passages, and stores embeddings in Qdrant. Questions retrieve relevant passages before DeepSeek generates a grounded answer.
+This repository contains the FastAPI API, OCR, retrieval-augmented generation (RAG), authentication and storage integrations. The [frontend](../Query-Assistant-frontend/README.md) provides the browser workspace.
 
-## Capabilities
+> **Upload → Extract/OCR → Clean → Chunk → Embed → Store → Retrieve → Answer with sources.** Documents are indexed separately from questions; another question does not run OCR again.
 
-- Text extraction with PyMuPDF and image OCR with Tesseract.
-- Optional DeepSeek normalization with rule-based cleanup fallback.
-- Heading-aware chunking and near-duplicate embedding removal.
-- SHA-256 ingestion registry to avoid processing unchanged PDFs again.
-- Separate Qdrant collections and PDF folders for each knowledge base.
-- Built-in Customer Support and Legal Assistant personas.
-- Persistent custom knowledge bases with user-defined names and rename support.
-- Conversational follow-up queries, cited answers, and standalone passage search.
-- FastAPI endpoints, a command-line interface, and an alternative Streamlit UI.
-- English answers to English questions and Roman Urdu answers to Roman Urdu questions.
+## Contents
 
-## Architecture
+- [Current implementation](#current-implementation)
+- [Architecture and data flow](#architecture-and-data-flow)
+- [Models and responsibilities](#models-and-responsibilities)
+- [API keys and credentials](#api-keys-and-credentials)
+- [Supported files and OCR preview](#supported-files-and-ocr-preview)
+- [Setup and runtime modes](#setup-and-runtime-modes)
+- [Configuration reference](#configuration-reference)
+- [API reference](#api-reference)
+- [Storage and isolation](#storage-and-isolation)
+- [Project structure](#project-structure)
+- [Verification](#verification)
+- [Troubleshooting](#troubleshooting)
+- [Presentation notes](#presentation-notes)
 
-```text
-PDF -> Text extraction + OCR -> Cleanup -> Chunking -> Embeddings -> Qdrant
-                                                                        |
-Question + chat history -> Query rewrite -> Query embedding -> Retrieval -+
-                                                              |
-                                                   DeepSeek -> Answer + sources
+## Current implementation
+
+This is the development configuration inspected on **9 November 2026**. Deployed environment variables must be checked separately. No secret values are included.
+
+| Layer | Current selection | Responsibility |
+| --- | --- | --- |
+| Browser | HTML, CSS, native JavaScript | Login, selection, uploads, OCR preview, chat and passage search |
+| HTTP backend | FastAPI + Uvicorn | Authenticate requests, validate input and coordinate processing |
+| Document storage | Supabase private Storage | Persist uploaded PDFs; images are normalized internally to PDFs |
+| Metadata | Supabase Postgres | Knowledge-base names, document status, progress and processing leases |
+| Image decoder | Pillow `>=11.3` | Decode supported images, correct orientation and flatten transparency |
+| PDF extraction | PyMuPDF | Read text layers/images and render scans for OCR |
+| OCR | Tesseract through `pytesseract`, language `eng` | Recognize image text; current cloud-storage setup selects `OCR_PROVIDER=tesseract` on this Python host |
+| Language model | DeepSeek `deepseek-chat` | Optional text normalization, follow-up query rewriting and final answers |
+| Embedding model | OpenRouter `nvidia/nemotron-3-embed-1b:free` | Convert passages and questions into current configured **2048-dimensional** vectors |
+| Vector storage | Remote Qdrant | Search relevant passages within the selected knowledge base |
+
+Customer Support and Legal Assistant are **personas using the same configured models**, not separately trained models. Custom knowledge bases use the same pipeline with their own document collections.
+
+## Architecture and data flow
+
+### System architecture
+
+```mermaid
+flowchart TB
+    User[User] --> UI[Browser workspace]
+    UI -->|Authenticated HTTP| API[FastAPI backend]
+    API --> Auth[Admin credential verification]
+    API --> Extract[PyMuPDF + Pillow + OCR]
+    Extract --> Raw[Raw image OCR preview]
+    Extract --> Clean[Cleanup and optional DeepSeek normalization]
+    Clean --> Chunk[Page-aware chunks]
+    Chunk --> Embed[Configured embedding model]
+    Embed --> Qdrant[(Qdrant vectors and passage metadata)]
+    API --> Supabase[(Supabase metadata and private files)]
+    API --> Query[Question + optional history rewrite]
+    Query --> QueryEmbed[Same embedding model]
+    QueryEmbed --> Qdrant
+    Qdrant --> Context[Relevant passages from selected collection]
+    Context --> DeepSeek[DeepSeek answer generation]
+    DeepSeek --> Result[Answer + document/page citations]
+    Result --> UI
+    Raw --> UI
 ```
 
-PDF ingestion is separate from question answering. Once a PDF is indexed, queries search its stored vectors rather than re-extracting the document.
+### Document ingestion: upload once, search repeatedly
 
-## Technology
+| Step | Component | Input → output / purpose |
+| --- | --- | --- |
+| 1. Authenticate and select | Middleware + `domains.py` | Admin credentials and knowledge-base key → selected workspace |
+| 2. Validate | `api_server.py`, `extract.py` | File → checked extension, actual readability, size and decoding limits |
+| 3. Identify | SHA-256 | Original file bytes → content hash for duplicate detection |
+| 4. Extract | PyMuPDF + Tesseract, or configured OCR API | Digital text/images/scans → page-numbered text |
+| 5. Preserve preview | Registry / private PDF preview artifact | Raw image OCR → text visible before LLM normalization |
+| 6. Normalize | `clean.py`, optionally DeepSeek | Extracted content → merged text and structured sections; rule-based fallback |
+| 7. Chunk | `chunk.py` | Clean sections → passages with filename, page and heading metadata |
+| 8. Embed | `embed.py` | Passage text → vectors; local ingestion also removes near-duplicate vectors |
+| 9. Index and finish | Qdrant + registry / Supabase | Vectors and metadata → searchable document and processing report |
 
-| Component | Implementation |
+**Local storage mode** runs ingestion in a background thread and streams activity events. **Supabase mode** saves a job and processes one page per `/step` request. Leases and cached page chunks support retries; incomplete cloud documents are excluded from search until ready.
+
+### Question answering
+
+```mermaid
+flowchart LR
+    Q[Question] --> H{Previous chat context?}
+    H -->|Yes| Rewrite[DeepSeek standalone query rewrite]
+    H -->|No| E[Embed query]
+    Rewrite --> E
+    E --> Search[Qdrant similarity search]
+    Search --> TopK[Top K passages from selected collection]
+    TopK --> LLM[DeepSeek + document-only prompt]
+    LLM --> A[Answer + supporting sources]
+```
+
+If rewriting fails, retrieval uses the original question. **Search passages** uses query embedding and retrieval without generating an LLM answer. The answer prompt requests document-grounded responses, citations and the question's language; this does not guarantee generated text is error-free.
+
+## Models and responsibilities
+
+| Model / engine | Used where | Task | Activation / configuration |
+| --- | --- | --- | --- |
+| DeepSeek `deepseek-chat` | `clean.py` → `llm.py` | Optional normalization into structured sections | `DEEPSEEK_MODEL`; **Use LLM normalization**; rule-based fallback available |
+| DeepSeek `deepseek-chat` | `answer.py` → `llm.py` | Resolve follow-ups into standalone retrieval queries | When chat history is supplied; falls back to original question |
+| DeepSeek `deepseek-chat` | `answer.py` → `llm.py` | Answer from retrieved excerpts and select supporting sources | `DEEPSEEK_API_KEY`, `DEEPSEEK_BASE_URL`, `DEEPSEEK_MODEL` |
+| NVIDIA `nvidia/nemotron-3-embed-1b:free` through OpenRouter | `embed.py` → `APIEmbedder` | Current passage/query embeddings, configured at `2048` dimensions | `EMBEDDING_API_MODEL`, `EMBEDDING_API_URL`, `EMBEDDING_DIMENSIONS`; provider availability is external |
+| `intfloat/multilingual-e5-small` | `embed.py` → local `Embedder` | Alternative local embeddings through Sentence Transformers; uses `passage:` / `query:` prefixes | Default `EMBEDDING_MODEL` when `EMBEDDING_PROVIDER=local`; **not active in the current cloud configuration** |
+| Tesseract OCR | `extract.py`, cloud path in `cloud.py` | Recognize characters in images; does not generate conversational answers | Current host OCR; Supabase mode selects it with `OCR_PROVIDER=tesseract` |
+| Mistral-compatible `mistral-ocr-latest` | `cloud.py` | Alternative hosted OCR for image/scanned PDF pages | Cloud default when `OCR_PROVIDER` is unset; requires `OCR_API_KEY`; **not active in current Tesseract setup** |
+
+PyMuPDF, Pillow, FastAPI, Supabase and Qdrant are tools/services, not language models. The `openai` Python package is a client for DeepSeek's compatible API; it does not mean a GPT model or OpenAI API key is used.
+
+## API keys and credentials
+
+Provider secrets are read **only by the backend** from `.env` or server environment. This table lists names, never actual key values.
+
+| Variable | Service | Used in | Purpose | Required when |
+| --- | --- | --- | --- | --- |
+| `DEEPSEEK_API_KEY` | DeepSeek | `llm.py` | Authenticate cleanup, rewrite and answer requests | Generated answers; LLM cleanup when enabled |
+| `EMBEDDING_API_KEY` | Embedding API; currently OpenRouter | `embed.py` | Authenticate passage and query embeddings | `EMBEDDING_PROVIDER=api` |
+| `SUPABASE_SERVICE_ROLE_KEY` | Supabase | `cloud.py`, indirectly domain persistence | Server access to metadata, private files and processing RPCs | `STORAGE_BACKEND=supabase`; use the configured service-role credential, not a browser anon key |
+| `QDRANT_API_KEY` | Remote Qdrant | `vectorstore.py` | Authenticate vector writes, search and deletion | Remote instance requires credentials |
+| `OCR_API_KEY` | Mistral-compatible OCR provider | `cloud.py` | Authenticate remote OCR | Cloud API OCR only; not required for Tesseract |
+| `ADMIN_USERNAME` + `ADMIN_PASSWORD` | Application login | `admin_auth.py`, API middleware | Verify HTTP Basic credentials | All application HTTP access; not a provider API key |
+| No API key | Tesseract | `extract.py` | Host OCR inference | Executable, `pytesseract` and language data required |
+| No API key | Local Sentence Transformers | `embed.py` | Local embedding inference | Local dependencies and initial model availability required |
+
+Service URLs identify endpoints; they do not replace credentials. A DeepSeek key is not used for OpenRouter embeddings. The frontend's `BACKEND_URL` is a **public URL**, not a secret.
+
+### Authentication and browser session
+
+Every application route, including health and API documentation, is protected. CORS preflight is allowed. Missing admin configuration returns HTTP 503; invalid/missing credentials return HTTP 401. Use HTTPS when deployed.
+
+The frontend sends HTTP Basic credentials and saves a backend-scoped tab session in `sessionStorage`, allowing login to resume on refresh. Logout clears it. This is a single-admin workspace, not a multi-user account system; collection isolation does not constitute per-user authorization.
+
+## Supported files and OCR preview
+
+| Input | Extraction behavior |
 | --- | --- |
-| HTTP API | FastAPI, Uvicorn, Pydantic |
-| PDF extraction | PyMuPDF |
-| OCR | Pytesseract and the Tesseract executable |
-| Cleanup and answers | DeepSeek through the OpenAI-compatible SDK |
-| Embeddings | `intfloat/multilingual-e5-small` via Sentence Transformers |
-| Vector database | Qdrant, embedded locally or accessed over HTTP |
-| Alternative interface | Streamlit |
+| `.pdf` | Extract text layer; OCR embedded images/scanned content when needed |
+| `.jpg`, `.jpeg`, `.jfif` | Decode JPEG and run OCR |
+| `.png` | Decode, flatten transparency onto white and run OCR |
+| `.webp` | Decode WebP and run OCR |
+| `.bmp` | Decode bitmap and run OCR |
+| `.tif`, `.tiff` | Decode and OCR every TIFF page |
+| `.avif` | Decode AVIF and run OCR; needs a Pillow build with AVIF support |
 
-## Requirements
+Limits: **4,000,000 bytes per upload**, **500 PDF/TIFF pages**, **50 million total decoded image pixels**. Animated PNG/WebP/AVIF use the first frame. Pillow `>=11.3` is declared for AVIF support in standard wheels. OCR quality depends on text size, contrast, orientation and installed language data.
 
-- Python 3.10 or later with compatible dependency wheels.
-- Tesseract OCR installed separately for scanned pages and embedded image text.
-- A DeepSeek API key for generated answers and model-assisted cleanup.
-- Writable, persistent storage for uploaded PDFs and runtime data.
-- Internet access for initial embedding-model download and DeepSeek requests.
+Raw image text appears in a **soft golden panel** with **EXTRACTED FROM IMAGE**, filename and **View text** access for saved images. This is the original OCR output, not LLM-cleaned text. Browser rendering uses `textContent`, not executable HTML.
 
-Without a DeepSeek key, rule-based ingestion and passage search remain available. OCR image text is skipped when Tesseract is unavailable.
+In Supabase mode, uploaded images are normalized to PDFs. Exact UTF-8 OCR is stored as attachments in a separate `.ocr.pdf` artifact, compatible with the **PDF-only private bucket**. TIFF previews retain every page; retries replace that page's text. Document deletion also removes previews. No bucket MIME expansion or database migration is required for these image formats.
 
-## Quick start
+## Setup and runtime modes
 
-Run these commands from the backend directory.
+### Requirements
 
-### Windows PowerShell
+- Python **3.12** for the declared packaging range (`>=3.12,<3.13` in `pyproject.toml`).
+- Core packages from `requirements.txt`, including Pillow `>=11.3`.
+- `requirements-local.txt` for local embeddings, `pytesseract`, Streamlit and sample tools.
+- Tesseract executable and installed language data for host OCR.
+- Credentials and service access for the selected runtime mode.
+
+| Mode | Settings | Persistent data | OCR |
+| --- | --- | --- | --- |
+| Local storage/embeddings | `STORAGE_BACKEND=local`, `EMBEDDING_PROVIDER=local` | Disk files/registries; embedded Qdrant when `QDRANT_URL` is empty | Tesseract |
+| Supabase on a Python host | `STORAGE_BACKEND=supabase`, `EMBEDDING_PROVIDER=api` | Supabase + remote Qdrant | Host Tesseract with `OCR_PROVIDER=tesseract`, or OCR API |
+| Lightweight Vercel backend | Supabase + API embeddings | Supabase + remote Qdrant | OCR API unless runtime separately includes Tesseract |
+
+The **current development setup combines Supabase storage, API embeddings and host Tesseract**. Cloud storage does not require OCR to be remote.
+
+### Local setup: Windows PowerShell
+
+Run inside `Query-Assistant-backend`:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements-local.txt
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and enter your real `DEEPSEEK_API_KEY`. Set `TESSERACT_CMD` if Tesseract is not discoverable on your system. Then start the API:
+Copy the example only for a **new installation**; retain an existing configured `.env`. Configure admin credentials, `DEEPSEEK_API_KEY` and Tesseract. For local storage, select:
+
+```dotenv
+STORAGE_BACKEND=local
+EMBEDDING_PROVIDER=local
+EMBEDDING_MODEL=intfloat/multilingual-e5-small
+QDRANT_URL=
+OCR_LANG=eng
+```
+
+Start the current API:
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn api_server:app --port 8000
+.\.venv\Scripts\python.exe -m uvicorn api_server:app --port 8000 --reload
 ```
 
-### macOS / Linux
+On macOS/Linux, create/activate a virtual environment, install the same requirements and use `python -m uvicorn api_server:app --port 8000 --reload`. Install Tesseract through the OS package manager and remove a Windows-specific executable path when using PATH detection.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-cp .env.example .env
-# Edit .env before starting the server.
-python -m uvicorn api_server:app --port 8000
-```
+### Supabase setup
 
-Install Tesseract using your operating system's package manager. On non-Windows systems, remove the Windows-specific `TESSERACT_CMD` value from `.env` when Tesseract is already on PATH.
+Use `.env.cloud.example` as a configuration reference. Run [supabase/setup.sql](supabase/setup.sql) in the intended project; configure private storage, embedding API, remote Qdrant and admin credentials. On a Tesseract host install `requirements-local.txt` and select `OCR_PROVIDER=tesseract`; otherwise configure `OCR_API_KEY`. See [DEPLOY_VERCEL.md](DEPLOY_VERCEL.md) for cloud deployment.
 
-| Resource | Local URL |
+| Resource | Development URL |
 | --- | --- |
-| API health | http://localhost:8000/api/health |
-| Interactive API documentation | http://localhost:8000/docs |
-| OpenAPI schema | http://localhost:8000/openapi.json |
+| Frontend | `http://localhost:3000` |
+| Authenticated health | `http://localhost:8000/api/health` |
+| Swagger UI | `http://localhost:8000/docs` |
+| OpenAPI schema | `http://localhost:8000/openapi.json` |
 
-Start the [frontend](../ocr-frontend/README.md) in a second terminal. Its default origin, `http://localhost:3000`, is already allowed by CORS. Use **`api_server.py`** for the current frontend; `api.py` is an older API with different routes.
+Use **`api_server:app`** for the browser frontend. `api.py` is a legacy contract. `--reload` is for development; restart manually after environment changes to ensure settings are loaded.
 
-## First document
+## Configuration reference
 
-Choose Customer Support or Legal Assistant in the frontend and click **Use bundled documents**. Alternatively, upload a PDF and wait for ingestion to finish. Shipping the sample PDFs does not automatically index them.
-
-For any other topic, create a named knowledge base in the frontend or call `POST /api/domains`. Upload related PDFs to its returned key. Each knowledge base has an independent collection, and answers are retrieved only from that collection.
-
-Custom names accept 1-80 characters. Names must be unique, ignoring case. Renaming a custom knowledge base preserves its key, PDFs, and vectors. Built-in assistants cannot be renamed through this endpoint.
-
-## Configuration
-
-Copy `.env.example` to `.env`. Existing process environment variables can also provide configuration. Restart the server after changing settings.
-
-| Variable | Default | Purpose |
+| Variable | Code default | Purpose |
 | --- | --- | --- |
-| `DEEPSEEK_API_KEY` | Empty | Provider key for answers and LLM cleanup |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | OpenAI-compatible endpoint |
-| `DEEPSEEK_MODEL` | `deepseek-chat` | Generation model |
-| `EMBEDDING_MODEL` | `intfloat/multilingual-e5-small` | Passage and query embeddings |
-| `QDRANT_URL` | Empty | Empty selects local embedded storage |
-| `QDRANT_API_KEY` | Empty | Optional remote Qdrant credentials |
-| `CHUNK_CHARS` | `1000` | Target passage size |
-| `CHUNK_OVERLAP_CHARS` | `150` | Passage overlap |
-| `TOP_K` | `5` | Default retrieval count |
-| `NEAR_DUPLICATE_THRESHOLD` | `0.97` | Embedding similarity cutoff |
-| `TESSERACT_CMD` | Auto-detected | Path to the OCR executable |
-| `OCR_LANG` | `eng` | Installed Tesseract language data |
-| `OCR_PSM` | `6` | OCR page segmentation mode |
-| `MIN_IMAGE_PIXELS` | `120` | Small-image filtering threshold |
+| `STORAGE_BACKEND` | `local`; `supabase` when `VERCEL` is set | Metadata/file persistence mode |
+| `EMBEDDING_PROVIDER` | `api` in Supabase mode; otherwise `local` | Embedding implementation |
+| `EMBEDDING_API_URL` | Empty | Full compatible `/embeddings` endpoint |
+| `EMBEDDING_API_MODEL` | Empty | Exact provider model identifier |
+| `EMBEDDING_DIMENSIONS` | `0` | Required actual API output dimension |
+| `EMBEDDING_MODEL` | `intfloat/multilingual-e5-small` | Alternative local embedding model |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | LLM base URL |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | Cleanup, rewrite and answer model |
+| `OCR_PROVIDER` | `api` in cloud OCR path | Select `tesseract` for Supabase with host OCR; local extraction uses Tesseract |
+| `OCR_API_URL` | `https://api.mistral.ai/v1/ocr` | Hosted OCR endpoint |
+| `OCR_API_MODEL` | `mistral-ocr-latest` | Hosted OCR model |
+| `TESSERACT_CMD` | Auto-detected | OCR executable path; standard Windows path is checked |
+| `OCR_LANG` / `OCR_PSM` | `eng` / `6` | Language data/default segmentation; whole-page/image OCR uses PSM `3` |
+| `MIN_IMAGE_PIXELS` | `120` | Embedded-PDF-image filtering threshold |
+| `SUPABASE_URL` | Empty | Supabase project URL |
+| `SUPABASE_BUCKET` | `knowledge-pdfs` | Private file bucket |
+| `QDRANT_URL` | Empty | Remote vector server; empty uses embedded storage in local mode |
+| `CORS_ORIGINS` | localhost and 127.0.0.1 on port `3000` | Comma-separated allowed frontend origins |
+| `CHUNK_CHARS` / `CHUNK_OVERLAP_CHARS` | `1000` / `150` | Target passage size/overlap in characters, not tokens |
+| `TOP_K` | `5` | Retrieval count; HTTP UI accepts 1–20 |
+| `NEAR_DUPLICATE_THRESHOLD` | `0.97` | Local-ingestion cosine similarity cutoff |
 
-**Local Qdrant has a single-process lock.** Run the API, Streamlit, or CLI against the embedded folder one at a time. Do not start multiple API workers with embedded storage. Use a remote Qdrant server when multiple processes need database access; file-based registries still require coordinated writes.
+Secret variables are documented in the credentials table. Passage and query vectors must use the same model/dimensions. Changing API embedding configuration changes the cloud namespace; existing vectors are not automatically migrated.
 
 ## API reference
 
-All routes below are relative to the server origin.
+All application routes require admin authentication.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| GET | `/api/health` | API health and configuration flags |
-| GET | `/api/domains` | Built-in and saved custom knowledge bases |
-| POST | `/api/domains` | Create a custom knowledge base |
-| PATCH | `/api/domains/{key}` | Rename a custom knowledge base |
-| GET | `/api/domains/{key}/status` | Indexed passage count and processed files |
-| POST | `/api/domains/{key}/ingest` | Process an uploaded PDF or existing PDFs |
-| POST | `/api/domains/{key}/ask` | Answer with retrieval and citations |
-| POST | `/api/domains/{key}/search` | Retrieve passages without answer generation |
-| POST | `/api/domains/{key}/reset` | Clear indexed content and its processing registry |
+| GET | `/api/auth/session` | Verify credentials / resume login |
+| GET | `/api/health` | Configuration flags; not a complete service connectivity check |
+| GET | `/api/domains` | List built-in/custom bases |
+| POST | `/api/domains` | Create base with `{"name":"Research Notes"}` |
+| PATCH | `/api/domains/{key}` | Rename custom base |
+| DELETE | `/api/domains/{key}` | Delete custom base and its content |
+| GET | `/api/domains/{key}/status` | Ready/pending files and passage counts |
+| POST | `/api/domains/{key}/ingest` | Upload or process/resume saved files |
+| POST | `/api/domains/{key}/documents/{file_hash}/step` | Process next cloud page |
+| GET | `/api/domains/{key}/documents/{file_hash}/text` | Read image's raw OCR preview |
+| DELETE | `/api/domains/{key}/documents/{file_hash}` | Remove document, vectors and preview |
+| POST | `/api/domains/{key}/ask` | Retrieve and generate cited answer |
+| POST | `/api/domains/{key}/search` | Retrieve passages without generation |
+| POST | `/api/domains/{key}/reset` | Local reset; disabled in Supabase mode |
 
-Create or rename a knowledge base with JSON:
+### Request and response contracts
 
-```json
-{"name": "Research Notes"}
-```
+Ingestion uses multipart `file` (optional), `force=false`, `use_llm=true`.
 
-Creation returns HTTP 201 and an internal key such as `custom_<uuid>`. Use that returned key for subsequent requests. Display names do not determine filesystem paths.
+| Mode | Response | Client behavior |
+| --- | --- | --- |
+| Local | NDJSON `log`, `done`, `error` events | Read through completion; inspect errors even after HTTP 200 |
+| Supabase | JSON `{"jobs":[...]}` | Call each `/step` until `ready`; resume after interruption |
 
-Ask a question:
+Cloud rebuilds use document deletion/re-upload; local forced ingestion uses `force=true`. Omitting `file` processes saved local files or resumes pending cloud jobs.
 
-```json
-{
-  "question": "What are the main conclusions?",
-  "history": [],
-  "top_k": 5
-}
-```
+Ask with `{"question":"What is the return period?","history":[],"top_k":5}`. Response fields: `answer`, cited `sources`, retrieval `query`, raw `hits`. Sources contain text, similarity scores and filename/page/heading metadata. Search accepts `{"query":"return period","top_k":5}` and returns `hits`. Preview returns `{"name":"notes.png","text":"Recognized text..."}`.
 
-`history` contains previous messages as `{"role": "user", "content": "..."}` or assistant equivalents. Answers include `answer`, cited `sources`, the retrieval `query`, and raw `hits`. A source contains `text`, `metadata`, and a similarity `score`. Metadata includes document name, page, and heading where available.
+## Storage and isolation
 
-Search with `{"query": "refund policy", "top_k": 5}`. The response contains `hits`.
+| Data | Local storage mode | Supabase storage mode |
+| --- | --- | --- |
+| Source uploads | `pdfs/<base>/` | Private bucket; images normalized to PDFs |
+| Custom base names | `data/custom_domains.json` | `qa_domains` |
+| Registry/progress | `data/registry.json` | `qa_documents` + claim/advance/release RPCs |
+| Extraction/normalization cache | `data/cache/` | Temporary cleanup cache and durable cached page chunks |
+| Raw image OCR preview | Image report in registry | UTF-8 attachments in private `.ocr.pdf` artifact |
+| Vectors + searchable text/metadata | Embedded or remote Qdrant | Remote Qdrant; namespace-qualified collections |
+| Conversation | Browser memory | Browser memory; not persisted in Supabase |
 
-### Ingestion stream
+Each base has its own vector collection. SHA-256 identifies file content. Renaming preserves the internal key and content. Document/base deletion is scoped to that selection. Built-in assistants cannot be renamed/deleted as custom bases.
 
-Use multipart form fields: optional `file`, `force` (default `false`), and `use_llm` (default `true`). Omitting `file` processes PDFs already present in the selected knowledge base's folder.
+Local Qdrant has a **single-process lock**: run API, Streamlit or CLI against that folder one at a time. Back up local `pdfs/` and `data/` together. Remote Qdrant does not replace source-file or registry backups.
 
-The response is `application/x-ndjson`, with one event per line:
-
-```json
-{"type": "log", "message": "STEP 5    chunking"}
-{"type": "done", "report": {"name": "notes.pdf", "status": "ingested", "chunks": 22}}
-```
-
-An ingestion failure produces an `error` event with a `message`. Clients must inspect stream events even after an HTTP 200 response. When processing multiple existing PDFs, the final `done` event reports the last PDF.
-
-Reset deletes the selected collection and ingestion-registry entries. It keeps the PDF files and custom knowledge-base name; process saved PDFs again to restore searchable content.
-
-To permanently remove a custom knowledge base, select it in the frontend and click **Delete this knowledge base**, then confirm. This deletes only that base's saved PDF folder, vector collection, ingestion records, and saved name. Other bases are preserved. The API endpoint is `DELETE /api/domains/{key}`; built-in assistants cannot be deleted.
-
-To remove just one PDF from any knowledge base (including Customer Support), click the trash icon beside that document and confirm. Only its saved PDF copies with matching content, vectors in the selected collection, and ingestion entry are removed. Other PDFs and knowledge bases are preserved. The selected base's browser conversation is cleared to avoid showing old citations. The API endpoint is `DELETE /api/domains/{key}/documents/{file_hash}`.
-
-## Storage and project structure
+## Project structure
 
 ```text
-ocr-backend/
-|-- api_server.py          # Current frontend API
-|-- api.py                 # Legacy API
-|-- app.py                 # Alternative Streamlit interface
-|-- cli.py                 # Built-in assistant CLI
-|-- src/rag/
-|   |-- config.py          # Environment and filesystem configuration
-|   |-- domains.py         # Personas and custom knowledge-base persistence
-|   |-- extract.py         # PDF extraction and image OCR
-|   |-- clean.py           # Normalization and fallback cleanup
-|   |-- chunk.py           # Page-aware passages
-|   |-- embed.py           # Embeddings and near-duplicate removal
-|   |-- vectorstore.py     # Qdrant operations
-|   |-- ingest.py          # Processing pipeline and SHA-256 registry
-|   |-- llm.py             # Provider client
-|   `-- answer.py          # Retrieval and generated answers
-|-- pdfs/                  # Bundled and uploaded PDFs
-|-- data/                  # Generated runtime state, ignored by Git
-|-- scripts/               # Sample PDF generation
-|-- tests/                 # Offline validation
-|-- .env.example
-`-- requirements.txt
+Query-Assistant-backend/
+├── api_server.py          # Current authenticated frontend API
+├── api.py                 # Legacy API
+├── app.py                 # Alternative Streamlit UI
+├── cli.py                 # Command-line interface
+├── src/rag/
+│   ├── config.py          # Environment configuration
+│   ├── admin_auth.py      # Admin credential verification
+│   ├── domains.py         # Personas and custom bases
+│   ├── extract.py         # Validation, image decoding, PDF extraction, OCR
+│   ├── clean.py           # Rule-based / LLM normalization
+│   ├── chunk.py           # Page-aware passages
+│   ├── embed.py           # API/local embeddings
+│   ├── vectorstore.py     # Qdrant operations
+│   ├── ingest.py          # Local ingestion and registry
+│   ├── cloud.py           # Supabase jobs, cloud OCR and preview persistence
+│   ├── llm.py             # DeepSeek-compatible client
+│   └── answer.py          # Rewrite, retrieval and answers
+├── supabase/setup.sql     # Schema, RPCs and private PDF bucket
+├── pdfs/                  # Local uploads and bundled files
+├── data/                  # Local runtime state
+├── tests/                 # Validation and regression coverage
+├── requirements.txt       # Core/API dependencies
+├── requirements-local.txt # Local models, OCR and tools
+└── DEPLOY_VERCEL.md        # Cloud deployment guide
 ```
 
-Runtime data includes `data/registry.json`, `data/custom_domains.json`, `data/cache/`, and `data/qdrant_db/`. Back up `data/` and `pdfs/` together if indexed documents and custom names must survive machine changes. Remote Qdrant does not store the local JSON registries or original PDFs.
+Optional local interfaces: `python cli.py status`, `python cli.py ingest -d customer_support --no-llm`, `python cli.py ask -d customer_support "What is the delivery policy?"`, `streamlit run app.py`. The browser is the primary interface for custom-base management and cloud jobs.
 
-## CLI and alternative UI
+## Verification
 
-With the Python environment activated, run one process at a time when using embedded Qdrant:
+Select local test mode before offline discovery in PowerShell:
 
-```bash
-python cli.py ingest
-python cli.py ingest -d legal_assistant --pdf path/to/contract.pdf
-python cli.py ingest -d customer_support --no-llm
-python cli.py ask -d customer_support "What is the delivery policy?"
-python cli.py search -d customer_support "refund timeline"
-python cli.py chat -d legal_assistant
-python cli.py status
+```powershell
+$env:STORAGE_BACKEND='local'
+$env:EMBEDDING_PROVIDER='local'
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p 'test_*.py'
 ```
 
-The current CLI argument choices and Streamlit dropdown initialize from the built-in assistants. Create and manage custom knowledge bases through the current HTTP API or frontend.
+Fixtures isolate runtime data and mock external services. Coverage includes authentication, ingestion, retries, deletion, custom bases, preview text, PDF-only bucket compatibility and multi-page TIFF. Image tests run real Tesseract for all nine requested extensions when installed; they do not prove live provider availability or accuracy on every image.
 
-For the alternative built-in-assistant interface, stop the API before running:
-
-```bash
-streamlit run app.py
-```
-
-## Tests
-
-```bash
-python tests/test_custom_domains.py
-python tests/test_pipeline_offline.py
-python tests/test_app_offline.py
-```
-
-Custom-domain tests use the standard library and temporary storage. Pipeline tests use a fake embedder; Streamlit tests use a fake embedder and stubbed LLM. The latter two need installed project dependencies, but no provider key or real embedding-model download. These checks do not establish live OCR or DeepSeek service availability.
-
-## Deployment considerations
-
-Run the backend on a Python host with Tesseract, sufficient resources for the embedding model, and persistent storage for `pdfs/` and `data/`. A typical server entry point is:
-
-```bash
-python -m uvicorn api_server:app --host 0.0.0.0 --port 8000
-```
-
-Use the port expected by your host. Keep one API worker for the current local-storage design. Serve a public backend over HTTPS and add the frontend's exact origin to `allow_origins` in `api_server.py`.
-
-The frontend can be hosted separately on Vercel. This backend's persistent filesystem and model/OCR requirements call for additional adaptation before a serverless deployment; see [Vercel runtime documentation](https://vercel.com/docs/functions/runtimes).
-
-The current API is a shared workspace without authentication, per-user authorization, or upload quotas. Restrict access appropriately before exposing private documents publicly. CORS controls browser origins; it is not authentication. Keep secrets in server environment configuration.
+Standalone `test_pipeline_offline.py` and `test_app_offline.py` provide sample-document/Streamlit checks. They need local-mode settings and embedded Qdrant rather than a production vector server.
 
 ## Troubleshooting
 
-| Problem | Action |
+| Symptom | Action |
 | --- | --- |
-| Qdrant storage is already in use | Stop another API, Streamlit, or CLI process using the same local folder. |
-| Missing DeepSeek key | Configure `DEEPSEEK_API_KEY` and restart the server. |
-| Image text is missing | Check Tesseract installation, executable path, and language data. |
-| First ingestion takes longer | Allow the embedding model to download; inspect processing logs. |
-| Empty knowledge base | Complete ingestion before asking questions. |
-| Vectors fail after changing models | Reset the affected knowledge base, then re-ingest its PDFs. |
-| Frontend cannot connect | Check the API URL, HTTPS configuration, CORS allowlist, and backend logs. |
+| Preview route not found | Restart updated `api_server:app`; deploy matching backend for a hosted frontend |
+| Supabase rejects image/preview | Use current normalized PDF artifacts; check bucket, schema and credentials |
+| OCR unavailable | Check Tesseract, `requirements-local.txt`, executable path, language data and `OCR_PROVIDER` |
+| AVIF decode failure | Install declared Pillow requirements and a build with AVIF support |
+| Pending document | Resolve reported error and use **Resume saved documents**; a processing lease may need to expire |
+| Old cloud image lacks preview | Older indexed files may predate persistence; delete/re-upload that image if needed |
+| Search works, answers fail | Check DeepSeek settings, network access and quota |
+| HTTP 401 / 503 | Check admin login / required backend admin configuration |
+| Qdrant already in use | Stop another process using the embedded folder |
+| Frontend cannot connect | Check origin, HTTPS and `CORS_ORIGINS` |
+| Controls disabled | Select a base; complete ingestion before asking questions |
 
-## Repository hygiene
+## Presentation notes
 
-The `.gitignore` excludes environment secrets, virtual environments, caches, runtime databases, and uploaded PDFs. The two bundled sample PDFs and `.env.example` remain versionable. Files already tracked by Git are not removed by adding ignore rules; review staged changes before publishing.
-# Admin access
+| Talking point | Explanation |
+| --- | --- |
+| Problem | Information in documents, scans and images is difficult to search manually |
+| Extraction | PyMuPDF reads digital text; OCR recognizes image text |
+| Preparation | Cleanup and page-aware chunking prepare content for indexing |
+| Retrieval | Embeddings map passages/questions into vectors; Qdrant finds relevant passages |
+| Answering | DeepSeek uses retrieved excerpts to produce an answer with supporting sources |
+| Transparency | Raw OCR preview and expandable document/page citations make results inspectable |
+| Persistence | Supabase keeps cloud files/jobs/names; Qdrant keeps vectors and passage metadata |
+| Scope | Selected-base retrieval; no per-document model fine-tuning |
 
-Set `ADMIN_USERNAME=Admin` and `ADMIN_PASSWORD` in the backend Vercel project's
-Production environment and redeploy. Missing credentials disable all API access
-with HTTP 503. Every route, including health and API documentation, requires
-authentication; browser CORS preflight is allowed without credentials.
-
-The frontend signs in through `/api/auth/session` and sends HTTP Basic credentials
-over HTTPS on every API request. Credentials stay in tab memory only. Reloading
-or signing out requires another login. Changing the backend password invalidates
-the previous credentials after deployment. Never add this password to frontend
-environment variables, JavaScript, or tracked files.
-
+Suggested demo: **login → empty selection → create/select base → image upload → golden OCR preview → question → source citations → refresh → select saved base → View text**.

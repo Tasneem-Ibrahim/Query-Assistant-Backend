@@ -28,7 +28,8 @@ class Domain:
         return config.PDF_DIR / self.pdf_subdir
 
     def default_pdfs(self):
-        return sorted(self.pdf_dir.glob("*.pdf")) if self.pdf_dir.exists() else []
+        SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".jfif", ".webp", ".bmp", ".tif", ".tiff", ".avif"}
+        return sorted(p for p in self.pdf_dir.iterdir() if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS) if self.pdf_dir.exists() else []
 
 
 COMMON_RULES = """Rules:

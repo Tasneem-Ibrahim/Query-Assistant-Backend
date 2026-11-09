@@ -112,6 +112,8 @@ def ingest_pdf(
         "image_pages": sum(1 for p in raw_pages if p["is_image"]),
         "ingested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    if pdf_path.suffix.lower() in extract.IMAGE_EXTENSIONS:
+        report["extracted_text"] = "\n\n".join(text for page in raw_pages for text in page["image_text"])
     registry.setdefault(domain.key, {})[file_hash] = report
     _save_registry(registry)
     say(f"done in {time.time() - started:.1f}s")

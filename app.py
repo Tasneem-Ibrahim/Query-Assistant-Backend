@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 import streamlit as st  # noqa: E402
 
-from rag import answer, config, ingest  # noqa: E402
+from rag import answer, config, ingest, extract  # noqa: E402
 from rag.domains import DOMAINS  # noqa: E402
 
 st.set_page_config(page_title="PDF Assistants", page_icon="📄", layout="wide")
@@ -75,12 +75,21 @@ with st.sidebar:
     else:
         st.warning("No PDF processed yet.")
 
-    uploaded = st.file_uploader("Add another PDF", type="pdf", key=f"upload_{domain.key}")
-    if uploaded and st.button("Process uploaded PDF", use_container_width=True):
+    uploaded = st.file_uploader("Add a PDF or image", type=["pdf", "jpg", "jpeg", "png", "jfif", "webp", "bmp", "tif", "tiff", "avif"], key=f"upload_{domain.key}")
+    if uploaded and st.button("Process uploaded document", use_container_width=True):
         domain.pdf_dir.mkdir(parents=True, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9._-]+", "_", uploaded.name)
         target = domain.pdf_dir / safe
-        target.write_bytes(uploaded.getvalue())
+        content = uploaded.getvalue()
+        if len(content) > config.MAX_UPLOAD_BYTES:
+            st.error("Choose a document smaller than 4 MB.")
+            st.stop()
+        try:
+            extract.document_pdf(safe, content)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+        target.write_bytes(content)
         run_ingest(domain, [target])
         st.rerun()
 

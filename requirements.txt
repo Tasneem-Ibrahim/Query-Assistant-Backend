@@ -1,6 +1,6 @@
 # core pipeline
 pymupdf>=1.24            # PDF text + image extraction
-pillow>=10.0             # image handling for OCR
+pillow>=11.3             # image handling for OCR
 httpx>=0.27             # remote embeddings, OCR and Supabase REST
 qdrant-client>=1.9       # vector database
 openai>=1.40             # DeepSeek is OpenAI-compatible
