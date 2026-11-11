@@ -104,6 +104,10 @@ def _save_image_text(object_path, text, page=1):
              headers={"Content-Type": "application/pdf", "x-upsert": "true"})
 
 
+def read_document(object_path):
+    return _request("GET", _object_path(object_path)).content
+
+
 def read_image_text(object_path):
     response = _request("GET", _object_path(object_path + ".ocr.pdf"))
     try:

@@ -26,7 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-from fastapi.responses import JSONResponse, StreamingResponse  # noqa: E402
+from fastapi.responses import JSONResponse, StreamingResponse, Response  # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
 from rag import answer, config, ingest, extract  # noqa: E402
@@ -267,6 +267,33 @@ async def ingest_endpoint(
             yield json.dumps(item, ensure_ascii=False) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.get("/api/domains/{key}/documents/{file_hash}/pdf")
+def preview_pdf(key: str, file_hash: str):
+    domain = _domain(key)
+    if not re.fullmatch(r"[a-f0-9]{64}", file_hash):
+        raise HTTPException(400, "Invalid document identifier.")
+    if config.CLOUD_MODE:
+        from rag import cloud
+        row = next((row for row in cloud.documents(key) if row["file_hash"] == file_hash), None)
+        if not row:
+            raise HTTPException(404, "Document not found in this knowledge base.")
+        if Path(row["name"]).suffix.lower() != ".pdf":
+            raise HTTPException(400, "PDF preview is available for PDF documents.")
+        content = cloud.read_document(row["object_path"])
+    else:
+        row = ingest.list_ingested(key).get(file_hash)
+        if not row:
+            raise HTTPException(404, "Document not found in this knowledge base.")
+        if Path(row["name"]).suffix.lower() != ".pdf":
+            raise HTTPException(400, "PDF preview is available for PDF documents.")
+        path = next((p for p in domain.default_pdfs()
+                     if p.suffix.lower() == ".pdf" and extract.file_sha256(p) == file_hash), None)
+        if path is None:
+            raise HTTPException(404, "The original PDF is unavailable. Upload the PDF again.")
+        content = path.read_bytes()
+    return Response(content, media_type="application/pdf", headers={"Content-Disposition": "inline"})
 
 
 @app.get("/api/domains/{key}/documents/{file_hash}/text")
