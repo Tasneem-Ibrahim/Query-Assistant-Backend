@@ -1,0 +1,39 @@
+{
+  "engine": "5.5.3.20260724",
+  "metric": "Character error rate (%), whitespace normalized, case/punctuation preserved; lower is better",
+  "results": [
+    {
+      "sample": "clear_protected_text",
+      "reference": "Visiting Hours: 10:00 AM to 8:00 PM.\nMaximum of 2 visitors per patient.\nEmail: care@example.com; Fee: $25.50.",
+      "before_text": "Visiting Hours: 10:00 AM to 8:00 PM.\nMaximum of 2 visitors per patient.\nEmail: care@example.com; Fee: $25.50.",
+      "after_text": "Visiting Hours: 10:00 AM to 8:00 PM.\nMaximum of 2 visitors per patient.\nEmail: care@example.com; Fee: $25.50.",
+      "before_cer_percent": 0.0,
+      "after_cer_percent": 0.0,
+      "before_lines": 3,
+      "after_lines": 3,
+      "numeric_tokens_preserved": true
+    },
+    {
+      "sample": "blurred_protected_text",
+      "reference": "Visiting Hours: 10:00 AM to 8:00 PM.\nMaximum of 2 visitors per patient.\nEmail: care@example.com; Fee: $25.50.",
+      "before_text": "Visiting Hours: 10:00 AM to 8:00 PM.\nMaximum of 2 visitors per patient.\nEmail: care@example.com; Fee: $25.50.",
+      "after_text": "Visiting Hours: 10:00 AM to 8:00 PM.\nMaximum of 2 visitors per patient.\nEmail: care@example.com; Fee: $25.50.",
+      "before_cer_percent": 0.0,
+      "after_cer_percent": 0.0,
+      "before_lines": 3,
+      "after_lines": 3,
+      "numeric_tokens_preserved": true
+    },
+    {
+      "sample": "hospital_notice",
+      "reference": "Hospital Visiting Policy\nVisiting Hours:\nDaily from 10:00 AM to 8:00 PM.\nGuidelines:\n\u2022 Maximum of 2 visitors per patient.\n\u2022 Visitors must wear a face mask.\n\u2022 Please maintain a quiet environment.",
+      "before_text": "oF) Hospital Visiting Policy\nVisiting Hours:\nDaily from 10:00 AM to 8:00 PM.\nGuidelines:\n@ Maximum of 2 visitors per patient.\n@ Visitors must wear \u00ab face mask.\n@ Please maintain a quict environment.\nml)",
+      "after_text": "oF) Hospital Visiting Policy\nVisiting Hours:\nDaily from 10:00 AM to 8:00 PM.\nGuidelines:\n\u2022 Maximum of 2 visitors per patient.\n\u2022 Visitors must wear \u00ab face mask.\n\u2022 Please maintain a quict environment.\nml)",
+      "before_cer_percent": 6.7,
+      "after_cer_percent": 5.15,
+      "before_lines": 8,
+      "after_lines": 8,
+      "numeric_tokens_preserved": true
+    }
+  ]
+}

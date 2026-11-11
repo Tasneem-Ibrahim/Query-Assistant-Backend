@@ -1,0 +1,41 @@
+{
+  "engine": "5.5.3.20260724",
+  "metric": "Normalized character SequenceMatcher similarity (%), synthetic English samples",
+  "results": [
+    {
+      "sample": "clear",
+      "before_similarity": 100.0,
+      "after_similarity": 100.0,
+      "before_text": "Returns accepted within thirty days.\nKeep your receipt for a full refund.\n\nContact support for delivery updates.",
+      "after_text": "Returns accepted within thirty days.\nKeep your receipt for a full refund.\nContact support for delivery updates."
+    },
+    {
+      "sample": "blur",
+      "before_similarity": 100.0,
+      "after_similarity": 100.0,
+      "before_text": "Returns accepted within thirty days.\nKeep your receipt for a full refund.\nContact support for delivery updates.",
+      "after_text": "Returns accepted within thirty days.\nKeep your receipt for a full refund.\nContact support for delivery updates."
+    },
+    {
+      "sample": "small",
+      "before_similarity": 100.0,
+      "after_similarity": 100.0,
+      "before_text": "Returns accepted within thirty days.\nKeep your receipt for a full refund.\nContact support for delivery updates.",
+      "after_text": "Returns accepted within thirty days.\nKeep your receipt for a full refund.\nContact support for delivery updates."
+    },
+    {
+      "sample": "skew",
+      "before_similarity": 62.96,
+      "after_similarity": 100.0,
+      "before_text": "accepted within thirty days.\nra full refund.\n\ndelivery updates.\n\nReturns\nKeep your receipt fo\n\ncontact support for",
+      "after_text": "Returns accepted within thirty days.\nKeep your receipt for a full refund.\nContact support for delivery updates."
+    },
+    {
+      "sample": "shadow_noise",
+      "before_similarity": 0.0,
+      "after_similarity": 96.26,
+      "before_text": "",
+      "after_text": "aturns accepted. within thirty days.\n\u2018eep your receipt for a full refund.\nntact support f for delivery updates."
+    }
+  ]
+}

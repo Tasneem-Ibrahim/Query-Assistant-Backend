@@ -19,6 +19,7 @@ import pymupdf
 from PIL import Image, ImageOps
 
 from . import config
+from .ocr_refine import refine_ocr as _refine_ocr
 
 
 def file_sha256(path: Path) -> str:
@@ -30,19 +31,111 @@ def file_sha256(path: Path) -> str:
 
 
 def _prepare_for_ocr(img: Image.Image) -> Image.Image:
-    """Grayscale + upscale + contrast: small, coloured table images OCR much better this way."""
-    img = img.convert("RGB").convert("L")
-    if img.width < 1800:
-        scale = 1800 / img.width
-        img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+    """Conservative baseline, retained so enhancement cannot erase clear text."""
+    img = ImageOps.exif_transpose(img).convert("RGBA")
+    background = Image.new("RGBA", img.size, "white")
+    background.alpha_composite(img)
+    img = background.convert("L")
+    # Bound both magnification and total working pixels for tall/narrow images.
+    scale = min(max(1.0, 1800 / img.width), 4.0,
+                (12_000_000 / (img.width * img.height)) ** 0.5)
+    if scale != 1:
+        img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), Image.Resampling.LANCZOS)
     return ImageOps.autocontrast(img)
 
 
-def ocr_image(img: Image.Image, psm: int | None = None) -> str:
-    """OCR one PIL image. Raises a clear error when the OCR engine is unavailable.
+def _deskew(img: Image.Image) -> Image.Image:
+    """Correct small scan rotations only when row alignment clearly improves."""
+    import numpy as np
 
-    psm 6 (one uniform block, row by row) reads tables and infographics best; whole scanned
-    pages use psm 3 (automatic layout).
+    preview = img.copy()
+    preview.thumbnail((700, 700))
+    pixels = np.asarray(preview)
+    mask = Image.fromarray((pixels < min(180, float(pixels.mean()) - 25)).astype("uint8") * 255)
+    if np.count_nonzero(mask) < 40:
+        return img
+
+    def score(angle):
+        rows = np.asarray(mask.rotate(angle, resample=Image.Resampling.NEAREST, expand=True)).sum(axis=1, dtype=float)
+        return float(np.square(np.diff(rows)).sum())
+
+    baseline = score(0)
+    coarse = max(range(-8, 9), key=score)
+    angles = [coarse + offset / 4 for offset in range(-3, 4) if abs(coarse + offset / 4) <= 8]
+    angle = max(angles, key=score)
+    if abs(angle) < 0.5 or score(angle) < baseline * 1.20:
+        return img
+    return img.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True, fillcolor=255)
+
+
+def _ocr_variants(img: Image.Image):
+    """Generate expensive alternatives lazily, only after a weak baseline."""
+    import numpy as np
+    from PIL import ImageFilter
+
+    enhanced = _deskew(img.filter(ImageFilter.MedianFilter(3)))
+    enhanced = ImageOps.autocontrast(enhanced, cutoff=1).filter(
+        ImageFilter.UnsharpMask(radius=1.5, percent=160, threshold=3))
+    yield enhanced
+    # Local background normalization handles shadows and uneven illumination.
+    background = enhanced.filter(ImageFilter.GaussianBlur(15))
+    values = np.asarray(enhanced, dtype="float32")
+    local = np.asarray(background, dtype="float32")
+    yield Image.fromarray(np.where(values < local - 10, 0, 255).astype("uint8"))
+
+
+class _OCRResult(tuple):
+    """Keep internal positions alongside the existing four-value OCR score."""
+    def __new__(cls, values, data, image):
+        result = super().__new__(cls, values)
+        result.data, result.image = data, image
+        return result
+
+
+def _read_ocr(img: Image.Image, psm: int):
+    """Get text and character-weighted word confidence from one engine run."""
+    import pytesseract
+
+    data = pytesseract.image_to_data(img, lang=config.OCR_LANG,
+        config=f"--psm {psm}", output_type=pytesseract.Output.DICT, timeout=60)
+    lines = {}
+    weighted, characters, reliable = 0.0, 0, 0
+    for i, word in enumerate(data["text"]):
+        word = word.strip()
+        confidence = float(data["conf"][i])
+        if not word or confidence < 0:
+            continue
+        key = tuple(data[field][i] for field in ("page_num", "block_num", "par_num", "line_num"))
+        lines.setdefault(key, []).append(word)
+        length = len(word)
+        weighted += confidence * length
+        characters += length
+        if confidence >= 60:
+            reliable += length
+    text = "\n".join(" ".join(words) for words in lines.values())
+    confidence = weighted / characters if characters else 0.0
+    # Confidence alone can prefer one recognised word over an entire page.
+    quality = confidence * (reliable / characters if characters else 0) * min(1.0, characters / 20)
+    return _OCRResult((text, confidence, quality, characters), data, img)
+
+
+def _prefer_ocr(candidate, current) -> bool:
+    """Discount confidence gains obtained by dropping recognised content.
+
+    Segmentation can silently omit a difficult footer while raising average word
+    confidence. Compare candidates at a shared character coverage before replacing
+    an existing result. Never prefer output merely because it is longer.
+    """
+    coverage = min(1.0, candidate[3] / max(current[3], 1))
+    return candidate[2] * coverage > current[2] + 2
+
+
+def ocr_image(img: Image.Image, psm: int | None = None) -> str:
+    """Adaptive local OCR; preserve the baseline unless a retry scores better.
+
+    At most six page OCR calls plus eight targeted line calls. Explicit layout
+    modes participate in preprocessing retries; sparse layout is only tried
+    when the baseline is weak.
     """
     try:
         import pytesseract
@@ -51,18 +144,36 @@ def ocr_image(img: Image.Image, psm: int | None = None) -> str:
         if cmd:
             pytesseract.pytesseract.tesseract_cmd = cmd
         prepared = _prepare_for_ocr(img)
-        text = pytesseract.image_to_string(prepared, lang=config.OCR_LANG, config=f"--psm {psm or config.OCR_PSM}", timeout=60)
-        if len([l for l in text.splitlines() if l.strip()]) < 3 and psm is None:
-            # very little text found: sparse layouts (icons + labels, infographics) read better with psm 12
-            retry = pytesseract.image_to_string(prepared, lang=config.OCR_LANG, config="--psm 12", timeout=60)
-            if len(retry.strip()) > len(text.strip()):
-                text = retry
-    except Exception as exc:  # Tesseract missing / language data missing
+        mode = config.OCR_PSM if psm is None else psm
+        best = _read_ocr(prepared, mode)
+        if best[2] < 85 or best[3] < 20:
+            candidates = ((prepared, 12),)
+            # Retrying a candidate must not discard a successful baseline on timeout.
+            for candidate, layout in candidates:
+                if layout == mode:
+                    continue
+                try:
+                    result = _read_ocr(candidate, layout)
+                except RuntimeError:
+                    continue
+                if _prefer_ocr(result, best):
+                    best = result
+            for candidate in _ocr_variants(prepared):
+                for layout in dict.fromkeys((mode, 12)):
+                    try:
+                        result = _read_ocr(candidate, layout)
+                    except RuntimeError:
+                        continue
+                    if _prefer_ocr(result, best):
+                        best = result
+                    if best[2] >= 90 and best[3] >= 20:
+                        return _refine_ocr(best)
+        return _refine_ocr(best)
+    except Exception as exc:
         raise RuntimeError(
             "OCR failed. Install Tesseract and requirements-local.txt on the backend, "
             "check TESSERACT_CMD and OCR_LANG, then reprocess this document."
         ) from exc
-    return "\n".join(line.rstrip() for line in text.splitlines() if line.strip())
 
 
 def page_images(doc: pymupdf.Document, page: pymupdf.Page) -> list[Image.Image]:
@@ -94,7 +205,7 @@ def extract_pdf(
     config.ensure_dirs()
     pdf_path = Path(pdf_path)
     digest = file_sha256(pdf_path)
-    cache_file = config.CACHE_DIR / f"{digest}.ocr-v2.raw.json"
+    cache_file = config.CACHE_DIR / f"{digest}.ocr-v5.raw.json"
     if use_cache and cache_file.exists():
         if progress:
             progress("extraction loaded from cache")
