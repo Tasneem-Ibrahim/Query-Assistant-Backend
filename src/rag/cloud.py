@@ -223,6 +223,7 @@ def step(domain, digest):
         if chunks:
             embedder = embed.get_embedder()
             vectors = embedder.embed_passages([part["text"] for part in chunks])
+            chunks, vectors, _ = embed.drop_near_duplicates(chunks, vectors)
             # Keep stable page chunks on retries, including after a partial upsert.
             vectorstore.ensure_collection(domain.collection, embedder.dim)
             vectorstore.upsert(domain.collection, chunks, vectors)

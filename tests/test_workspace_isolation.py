@@ -179,6 +179,48 @@ class LocalWorkspaceTests(unittest.TestCase):
         self.assertEqual(result.status_code, 200, result.text)
         return next(iter(result.json()['files']))
 
+    def test_editor_save_is_private_replaces_search_and_preserves_original(self):
+        key = self.req('alice', 'POST', '/domains', json={'name': 'Editor'}).json()['key']
+        digest = self.upload('alice', key)
+        path = f'/domains/{key}/documents/{digest}'
+        before = self.req('alice', 'GET', path + '/chunks').json()
+        original = self.req('alice', 'GET', path + '/pdf').content
+        body = {'revision': before['revision'], 'chunks': [
+            {'text': '  Updated harvest date:   November 15. ', 'page': 1},
+            {'text': 'Updated harvest date: November 15.', 'page': 1}]}
+        for identity in ('bob', 'admin'):
+            self.assertEqual(self.req(identity, 'GET', path + '/chunks').status_code, 404)
+            self.assertEqual(self.req(identity, 'PUT', path + '/chunks', json=body).status_code, 404)
+        result = self.req('alice', 'PUT', path + '/chunks', json=body)
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual(result.json()['chunks'], [{'text': 'Updated harvest date: November 15.', 'page': 1}])
+        self.assertEqual(self.req('alice', 'GET', path + '/chunks').json(), result.json())
+        self.assertEqual(self.req('alice', 'GET', path + '/pdf').content, original)
+        hits = self.req('alice', 'POST', f'/domains/{key}/search', json={'query': 'harvest'}).json()['hits']
+        self.assertEqual([h['text'] for h in hits], ['Updated harvest date: November 15.'])
+        self.assertEqual(self.req('alice', 'PUT', path + '/chunks', json=body).status_code, 409)
+
+    def test_editor_invalid_input_and_failures_preserve_saved_content(self):
+        key = self.req('alice', 'POST', '/domains', json={'name': 'Safe edits'}).json()['key']
+        digest = self.upload('alice', key)
+        path = f'/domains/{key}/documents/{digest}/chunks'
+        before = self.req('alice', 'GET', path).json()
+        for entries in ([], [{'text': ' ', 'page': 1}], [{'text': 'Bad page', 'page': 99}]):
+            response = self.req('alice', 'PUT', path, json={'revision': before['revision'], 'chunks': entries})
+            self.assertEqual(response.status_code, 400, response.text)
+        with patch.object(embed, 'get_embedder') as factory:
+            factory.return_value.embed_passages.side_effect = ValueError('Embedding unavailable')
+            response = self.req('alice', 'PUT', path, json={
+                'revision': before['revision'], 'chunks': [{'text': 'Draft edit', 'page': 1}]})
+            self.assertEqual(response.status_code, 400)
+        from rag import document_editor
+        with as_user(ALICE):
+            domain = get_domain(key)
+            with patch.object(vectorstore, 'upsert', side_effect=RuntimeError('Vector failure')):
+                with self.assertRaises(RuntimeError):
+                    document_editor.save(domain, digest, before['revision'], [{'text': 'Draft edit', 'page': 1}])
+        self.assertEqual(self.req('alice', 'GET', path).json(), before)
+
     def test_legacy_admin_data_is_preserved_and_new_accounts_start_empty(self):
         # Seed through legacy local entrypoints to prove the old paths stay valid.
         with as_user(ADMIN):

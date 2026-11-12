@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse, Response  # noqa: E402
-from pydantic import BaseModel  # noqa: E402
+from pydantic import BaseModel, Field  # noqa: E402
 
 from rag import answer, config, ingest, extract  # noqa: E402
 from rag.domains import create_domain, delete_domain, get_domain, list_domains, rename_domain  # noqa: E402
@@ -279,6 +279,45 @@ async def ingest_endpoint(
             yield json.dumps(item, ensure_ascii=False) + "\n"
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+class EditedChunk(BaseModel):
+    text: str = Field(max_length=100000)
+    page: int = Field(ge=1)
+
+
+class DocumentEdit(BaseModel):
+    revision: str = Field(min_length=64, max_length=64)
+    chunks: list[EditedChunk] = Field(max_length=1000)
+
+
+@app.get("/api/domains/{key}/documents/{file_hash}/chunks")
+def document_chunks(key: str, file_hash: str):
+    from rag import document_editor
+    domain = _domain(key)
+    try:
+        return document_editor.read(domain, file_hash)
+    except KeyError:
+        raise HTTPException(404, "Document not found.")
+    except document_editor.EditConflict as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.put("/api/domains/{key}/documents/{file_hash}/chunks")
+def save_document_chunks(key: str, file_hash: str, body: DocumentEdit):
+    from rag import document_editor
+    domain = _domain(key)
+    try:
+        return document_editor.save(domain, file_hash, body.revision,
+                                    [part.model_dump() for part in body.chunks])
+    except KeyError:
+        raise HTTPException(404, "Document not found.")
+    except document_editor.EditConflict as exc:
+        raise HTTPException(409, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 
 @app.get("/api/domains/{key}/documents/{file_hash}/pdf")

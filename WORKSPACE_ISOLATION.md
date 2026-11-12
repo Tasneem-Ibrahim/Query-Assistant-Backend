@@ -39,3 +39,14 @@ This follow-up needs no new environment values or SQL migration beyond the origi
 `tests/test_workspace_isolation.py` tests local mode and cloud mode (mocked Supabase REST/auth, real temporary PDF parsing and Qdrant): legacy admin data, empty new accounts, direct foreign URLs, metadata/preview/delete/search/ask boundaries, identical PDFs, concurrent accounts, duplicate base names, invalid identities and missing-migration failure. These are offline tests, not a live Supabase migration or production isolation audit.
 
 The existing Vercel admin SQLite refresh-session persistence limitation is unchanged. OCR without a key is still deferred; this feature does not install an OCR engine.
+
+
+## Processed document editor
+
+Document **View / edit chunks** opens the actual indexed text, rather than the original PDF preview. Authenticated GET/PUT `/api/domains/{key}/documents/{hash}/chunks` use the same owner-qualified base/namespace as search and deletion. Existing processed uploads can be opened without reuploading. Incomplete cloud uploads must finish processing first.
+
+Save normalizes Unicode/whitespace, removes exact normalized chunk duplicates, splits oversized chunks and removes near-duplicate chunks using the configured embedding threshold. It does not send manual edits through the LLM, which could rewrite user changes. Source filename and original-page references remain attached; new content must be assigned to an original page. Page references identify the source location, not a claim that edited text still appears verbatim in the original PDF. The original upload is unchanged. Force reprocessing the original upload explicitly replaces edited chunks with content extracted from the original.
+
+Edited text persists in Qdrant payloads alongside its embeddings. Save embeds before modifying stored points, replaces only the selected file's points, updates its chunk count and clears local stale answers. Revision checking rejects stale editor saves. Cloud saves reuse the existing five-minute document lease; expired saves are rejected before writes. Failures attempt to restore the previous points; Supabase metadata and Qdrant are separate systems, so this is not a distributed transaction and a process crash/network outage during replacement still requires operational recovery. Unsaved browser drafts remain on normal save errors; navigating away, logging out or force reprocessing can discard drafts.
+
+No new env settings or SQL migrations are introduced by the editor. The earlier workspace isolation migration is still required. Deploy frontend/backend together. Live embedding-provider, hosted Qdrant/Supabase and serverless request-duration limits must be verified for the deployment; saves are synchronous and very large edits may exceed hosting time limits.
