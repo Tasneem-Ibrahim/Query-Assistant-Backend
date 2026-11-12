@@ -12,20 +12,20 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import chunk, clean, config, embed, extract, vectorstore
+from . import workspace, chunk, clean, config, embed, extract, vectorstore
 from .domains import Domain, get_domain
 
 
 # ---- registry of already-ingested files ----------------------------------- #
 def _load_registry() -> dict:
-    if config.REGISTRY_FILE.exists():
-        return json.loads(config.REGISTRY_FILE.read_text(encoding="utf-8"))
+    if workspace.registry_file().exists():
+        return json.loads(workspace.registry_file().read_text(encoding="utf-8"))
     return {}
 
 
 def _save_registry(registry: dict) -> None:
     config.ensure_dirs()
-    config.REGISTRY_FILE.write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
+    workspace.registry_file().write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def list_ingested(domain_key: str) -> dict[str, dict]:
@@ -147,7 +147,7 @@ def delete_document(domain_key: str, file_hash: str) -> None:
     known = registry.get(domain_key, {})
     if file_hash not in known:
         raise KeyError("Document not found in this knowledge base.")
-    root = config.PDF_DIR.resolve()
+    root = workspace.pdf_root().resolve()
     directory = domain.pdf_dir.resolve()
     if directory.parent != root or directory.name != domain.pdf_subdir or domain.pdf_dir.is_symlink():
         raise ValueError("Unsafe document directory.")

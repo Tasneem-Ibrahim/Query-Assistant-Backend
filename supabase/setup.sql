@@ -1,9 +1,16 @@
 -- Run once in the Supabase SQL Editor. Backend service-role access only.
 create table if not exists public.qa_domains (
-  key text primary key check (key ~ '^custom_[a-f0-9]{32}$'),
-  label text not null check (length(trim(label)) between 1 and 80)
+  owner_id text not null default 'admin',
+  key text not null check (key ~ '^custom_[a-f0-9]{32}$'),
+  label text not null check (length(trim(label)) between 1 and 80),
+  primary key (owner_id, key)
 );
-create unique index if not exists qa_domain_names on public.qa_domains (lower(trim(label)));
+-- Also upgrade existing shared custom registries without changing their keys.
+alter table public.qa_domains add column if not exists owner_id text not null default 'admin';
+alter table public.qa_domains drop constraint if exists qa_domains_pkey;
+alter table public.qa_domains add primary key (owner_id, key);
+drop index if exists public.qa_domain_names;
+create unique index qa_domain_names on public.qa_domains (owner_id, lower(trim(label)));
 
 create table if not exists public.qa_documents (
   namespace text not null,
@@ -25,7 +32,7 @@ create table if not exists public.qa_documents (
 );
 alter table public.qa_domains enable row level security;
 alter table public.qa_documents enable row level security;
-revoke all on public.qa_domains, public.qa_documents from anon, authenticated;
+revoke all on public.qa_domains, public.qa_documents from public, anon, authenticated;
 grant all on public.qa_domains, public.qa_documents to service_role;
 
 create or replace function public.qa_claim_document(

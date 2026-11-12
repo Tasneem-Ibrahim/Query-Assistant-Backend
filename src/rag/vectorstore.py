@@ -13,10 +13,19 @@ import threading
 import numpy as np
 from qdrant_client import QdrantClient, models
 
-from . import config
+from . import config, workspace
 
 _client: QdrantClient | None = None
 _lock = threading.Lock()
+
+
+def _check_workspace(name):
+    if not workspace.suffix() and (name.startswith("user_") or "_user_" in name):
+        raise ValueError("Collection does not belong to this workspace.")
+    if workspace.suffix():
+        prefix = config.embedding_namespace() + "_" if config.CLOUD_MODE else workspace.suffix() + "_"
+        if not name.startswith(prefix):
+            raise ValueError("Collection does not belong to this workspace.")
 
 
 def get_client() -> QdrantClient:
@@ -43,6 +52,7 @@ def close_client() -> None:
 
 
 def collection_exists(name: str) -> bool:
+    _check_workspace(name)
     return get_client().collection_exists(name)
 
 
@@ -59,6 +69,7 @@ def _ensure_file_hash_index(client: QdrantClient, name: str) -> None:
 
 
 def ensure_collection(name: str, dim: int) -> None:
+    _check_workspace(name)
     client = get_client()
     if not client.collection_exists(name):
         client.create_collection(
@@ -69,17 +80,20 @@ def ensure_collection(name: str, dim: int) -> None:
 
 
 def reset_collection(name: str) -> None:
+    _check_workspace(name)
     client = get_client()
     if client.collection_exists(name):
         client.delete_collection(name)
 
 
 def count(name: str) -> int:
+    _check_workspace(name)
     client = get_client()
     return client.count(collection_name=name, exact=True).count if client.collection_exists(name) else 0
 
 
 def upsert(name: str, chunks: list[dict], vectors: np.ndarray, batch_size: int = 64) -> None:
+    _check_workspace(name)
     client = get_client()
     points = [
         models.PointStruct(id=c["id"], vector=vectors[i].tolist(), payload={"text": c["text"], **c["metadata"]})
@@ -90,6 +104,7 @@ def upsert(name: str, chunks: list[dict], vectors: np.ndarray, batch_size: int =
 
 
 def delete_file(name: str, file_hash: str) -> None:
+    _check_workspace(name)
     client = get_client()
     if client.collection_exists(name):
         _ensure_file_hash_index(client, name)
@@ -104,6 +119,7 @@ def delete_file(name: str, file_hash: str) -> None:
 
 def search(name: str, vector: np.ndarray, top_k: int) -> list[dict]:
     """Similarity search. Returns [{'text', 'metadata', 'score'}], best first."""
+    _check_workspace(name)
     client = get_client()
     if not client.collection_exists(name):
         return []

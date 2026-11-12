@@ -136,7 +136,7 @@ Service URLs identify endpoints; they do not replace credentials. A DeepSeek key
 
 Every RAG route, including health and API documentation, is protected. Admin login, user signup/login/refresh/logout and CORS preflight are reachable before login. Missing Auth configuration returns HTTP 503; invalid/expired sessions return HTTP 401. Use HTTPS when deployed.
 
-Existing admin credentials in `.env` work through **Admin sign in**, without a Supabase account. Supabase Auth manages other users? email/password accounts and password hashes. HttpOnly cookies hold the access JWT (15-minute app limit) and rotating refresh token; a signed session deadline enforces seven days. Logout revokes the refresh session and clears cookies. Profiles live in `public.users` with row-level security. RAG knowledge bases remain shared among signed-in users. Complete the required [authentication setup](AUTH_SETUP.md), including the SQL migration and Supabase JWT expiry setting.
+Existing admin credentials in `.env` work through **Admin sign in**, without a Supabase account. Supabase Auth manages other users? email/password accounts and password hashes. HttpOnly cookies hold the access JWT (15-minute app limit) and rotating refresh token; a signed session deadline enforces seven days. Logout revokes the refresh session and clears cookies. Profiles live in `public.users` with row-level security. RAG knowledge bases and documents are private to each account; existing data stays with admin. Run the required [workspace migration](WORKSPACE_ISOLATION.md) before deploying. Complete the required [authentication setup](AUTH_SETUP.md), including the SQL migration and Supabase JWT expiry setting.
 
 ## Supported files and OCR preview
 
@@ -214,7 +214,7 @@ Use `.env.cloud.example` as a configuration reference. Run [supabase/setup.sql](
 | Swagger UI | `http://localhost:8000/docs` |
 | OpenAPI schema | `http://localhost:8000/openapi.json` |
 
-Use **`api_server:app`** for the browser frontend. `api.py` is a legacy contract. `--reload` is for development; restart manually after environment changes to ensure settings are loaded.
+Use **`api_server:app`** for the browser frontend. `api.py` is a compatibility entrypoint for the same authenticated API; obsolete shared-workspace routes are removed. `--reload` is for development; restart manually after environment changes to ensure settings are loaded.
 
 ## Configuration reference
 
@@ -295,7 +295,7 @@ Ask with `{"question":"What is the return period?","history":[],"top_k":5}`. Res
 | Vectors + searchable text/metadata | Embedded or remote Qdrant | Remote Qdrant; namespace-qualified collections |
 | Conversation | Browser memory | Browser memory; not persisted in Supabase |
 
-Each base has its own vector collection. SHA-256 identifies file content. Renaming preserves the internal key and content. Document/base deletion is scoped to that selection. Built-in assistants cannot be renamed/deleted as custom bases.
+Each account/base has its own vector collection. The paths above are legacy admin paths; other users have separate workspace paths/namespaces, described in [WORKSPACE_ISOLATION.md](WORKSPACE_ISOLATION.md). SHA-256 identifies file content. Renaming preserves the internal key and content. Document/base deletion is scoped to that selection. Built-in assistants cannot be renamed/deleted as custom bases.
 
 Local Qdrant has a **single-process lock**: run API, Streamlit or CLI against that folder one at a time. Back up local `pdfs/` and `data/` together. Remote Qdrant does not replace source-file or registry backups.
 
@@ -304,7 +304,7 @@ Local Qdrant has a **single-process lock**: run API, Streamlit or CLI against th
 ```text
 Query-Assistant-backend/
 ├── api_server.py          # Current authenticated frontend API
-├── api.py                 # Legacy API
+├── api.py                 # Alias for the authenticated API
 ├── app.py                 # Alternative Streamlit UI
 ├── cli.py                 # Command-line interface
 ├── src/rag/

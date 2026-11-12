@@ -20,6 +20,7 @@ import queue
 import re
 import sys
 import threading
+from contextvars import copy_context
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -32,7 +33,7 @@ from pydantic import BaseModel  # noqa: E402
 from rag import answer, config, ingest, extract  # noqa: E402
 from rag.domains import create_domain, delete_domain, get_domain, list_domains, rename_domain  # noqa: E402
 from rag.cloud import CloudStorageError  # noqa: E402
-from rag import user_auth  # noqa: E402
+from rag import user_auth, workspace  # noqa: E402
 
 app = FastAPI(title="Query Assistant API", version="1.0")
 app.include_router(user_auth.router)
@@ -45,6 +46,7 @@ async def storage_error_handler(request, exc):
 
 @app.middleware("http")
 async def require_user(request, call_next):
+    owner_token = None
     # Protect every RAG route, including future routes and API documentation.
     if request.method != "OPTIONS":
         try:
@@ -53,9 +55,17 @@ async def require_user(request, call_next):
             user_auth.check_origin(request)
             if request.url.path not in user_auth.PUBLIC_PATHS:
                 await user_auth.authenticate(request)
+                try:
+                    owner_token = workspace.bind(request.state.user)
+                except (ValueError, KeyError, TypeError):
+                    raise HTTPException(401, "Invalid account identity. Please sign in again.") from None
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers={"Cache-Control": "no-store"})
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    finally:
+        if owner_token is not None:
+            workspace.reset(owner_token)
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -258,7 +268,8 @@ async def ingest_endpoint(
         finally:
             events.put(None)
 
-    threading.Thread(target=work, daemon=True).start()
+    context = copy_context()
+    threading.Thread(target=context.run, args=(work,), daemon=True).start()
 
     def stream():
         while True:

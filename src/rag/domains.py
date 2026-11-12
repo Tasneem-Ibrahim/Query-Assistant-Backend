@@ -9,7 +9,7 @@ import shutil
 import threading
 import uuid
 
-from . import config
+from . import config, workspace
 
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class Domain:
 
     @property
     def pdf_dir(self):
-        return config.PDF_DIR / self.pdf_subdir
+        return workspace.pdf_root() / self.pdf_subdir
 
     def default_pdfs(self):
         SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".jfif", ".webp", ".bmp", ".tif", ".tiff", ".avif"}
@@ -103,13 +103,13 @@ def _custom_domain(key: str, label: str) -> Domain:
 
 
 def _custom_path():
-    return config.DATA_DIR / "custom_domains.json"
+    return workspace.data_dir() / "custom_domains.json"
 
 
 def _read_custom() -> dict[str, str]:
     if getattr(config, "CLOUD_MODE", False):
         from . import cloud
-        return {row["key"]: row["label"] for row in cloud.rows("qa_domains", order="key.asc")}
+        return {row["key"]: row["label"] for row in cloud.rows("qa_domains", owner_id="eq." + workspace.owner_id(), order="key.asc")}
     path = _custom_path()
     if not path.exists():
         return {}
@@ -125,7 +125,7 @@ def _read_custom() -> dict[str, str]:
 
 
 def _save_custom(data: dict[str, str]) -> None:
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    workspace.data_dir().mkdir(parents=True, exist_ok=True)
     path = _custom_path()
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -135,14 +135,13 @@ def _save_custom(data: dict[str, str]) -> None:
 def list_domains() -> list[Domain]:
     with _domain_lock:
         custom = _read_custom()
-        for key in list(DOMAINS):
-            if key not in _BUILTIN_KEYS and key not in custom:
-                DOMAINS.pop(key)
-        for key, label in custom.items():
-            DOMAINS[key] = _custom_domain(key, label)
-        domains = list(DOMAINS.values())
+        # No process-global custom registry: concurrent accounts must never share it.
+        domains = [DOMAINS[key] for key in DOMAINS if key in _BUILTIN_KEYS]
+        domains.extend(_custom_domain(key, label) for key, label in custom.items())
         if getattr(config, "CLOUD_MODE", False):
             domains = [replace(domain, collection=f"{config.embedding_namespace()}_{domain.key}") for domain in domains]
+        else:
+            domains = [replace(domain, collection=workspace.local_collection(domain.key)) for domain in domains]
         return domains
 
 
@@ -165,10 +164,9 @@ def create_domain(label: str) -> Domain:
         custom[key] = label
         if getattr(config, "CLOUD_MODE", False):
             from . import cloud
-            cloud.write("qa_domains", {"key": key, "label": label}, "key")
+            cloud.write("qa_domains", {"owner_id": workspace.owner_id(), "key": key, "label": label}, "owner_id,key")
         else:
             _save_custom(custom)
-        DOMAINS[key] = _custom_domain(key, label)
         return get_domain(key)
 
 
@@ -180,10 +178,9 @@ def rename_domain(key: str, label: str) -> Domain:
         custom[key] = _validate_label(label, custom, excluding=key)
         if getattr(config, "CLOUD_MODE", False):
             from . import cloud
-            cloud.write("qa_domains", {"key": key, "label": custom[key]}, "key")
+            cloud.write("qa_domains", {"owner_id": workspace.owner_id(), "key": key, "label": custom[key]}, "owner_id,key")
         else:
             _save_custom(custom)
-        DOMAINS[key] = _custom_domain(key, custom[key])
         return get_domain(key)
 
 
@@ -210,13 +207,13 @@ def delete_domain(key: str) -> None:
                 cloud.delete_document(domain, row["file_hash"])
             vectorstore.reset_collection(domain.collection)
             # Keep the name while any other embedding namespace still has documents.
-            if cloud.rows("qa_documents", domain="eq." + key):
+            if any(workspace.owns_namespace(row["namespace"])
+                   for row in cloud.rows("qa_documents", domain="eq." + key)):
                 raise ValueError("This base also has documents in another embedding configuration. Remove those before deleting its name.")
-            cloud.remove("qa_domains", key="eq." + key)
-            DOMAINS.pop(key, None)
+            cloud.remove("qa_domains", owner_id="eq." + workspace.owner_id(), key="eq." + key)
             return
-        domain = _custom_domain(key, custom[key])
-        pdf_root = config.PDF_DIR.resolve()
+        domain = get_domain(key)
+        pdf_root = workspace.pdf_root().resolve()
         target = domain.pdf_dir.resolve()
         if target.parent != pdf_root or target.name != key or domain.pdf_dir.is_symlink():
             raise ValueError("Knowledge base document path is unsafe.")
@@ -226,7 +223,6 @@ def delete_domain(key: str) -> None:
             shutil.rmtree(target)
         del custom[key]
         _save_custom(custom)
-        DOMAINS.pop(key, None)
 
 
 def system_prompt(domain: Domain) -> str:

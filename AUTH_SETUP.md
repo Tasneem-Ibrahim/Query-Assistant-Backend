@@ -27,6 +27,16 @@ Generate a secret with `python -c "import secrets; print(secrets.token_urlsafe(4
 
 For HTTPS deployment set `AUTH_COOKIE_SECURE=true`, and set exact frontend origins in `CORS_ORIGINS`. For unrelated frontend/backend sites, set `AUTH_COOKIE_SAMESITE=none` as well. Browsers may block third-party cookies: deploy behind one origin or use frontend/backend subdomains on the same site for reliable production sessions. Cookies are host-only, HttpOnly, and scoped to `/api`; the refresh endpoint never returns token values to JavaScript. Protected changes require a CSRF header and an allowed Origin.
 
+For the current separate Vercel projects, set these in the **backend Vercel project's environment variables**, then redeploy that project:
+
+```dotenv
+CORS_ORIGINS=https://query-assistant-frontend.vercel.app,http://localhost:3000,http://127.0.0.1:3000
+AUTH_COOKIE_SECURE=true
+AUTH_COOKIE_SAMESITE=none
+```
+
+Keep local HTTP development at `AUTH_COOKIE_SECURE=false` and `AUTH_COOKIE_SAMESITE=lax`. Local `.env` edits do not update Vercel. Frontend Vercel builds use `BACKEND_URL=https://query-assistant-backend.vercel.app`. A generic “Cannot reach the backend” message can also mean an unavailable backend or a blocked/redirected request; it alone does not prove a CORS failure. Check the browser Network panel for the failed request and OPTIONS response. These cookie settings still depend on the browser allowing third-party cookies; admin sessions additionally require the shared persistent store described below.
+
 Restart the backend and frontend after configuration. The frontend build needs only its existing public `BACKEND_URL`; no Supabase browser SDK or additional npm dependency is needed.
 
 ## Behavior and demo
@@ -37,7 +47,7 @@ Restart the backend and frontend after configuration. The frontend build needs o
 - The menu displays the user's name. Reload resumes the session using cookies. Once access expires, the next protected request refreshes and retries automatically. Concurrent requests in a tab share the refresh request.
 - Sign out revokes the Supabase refresh session and removes cookies. An expired or altered absolute-session cookie requires a fresh sign-in.
 
-The existing RAG knowledge bases remain a **shared workspace for signed-in users**; this change adds account authentication and private profile rows, not per-user document ownership. CLI/Streamlit entrypoints remain local tools outside the HTTP login flow.
+RAG workspaces are now private to each account. Complete [WORKSPACE_ISOLATION.md](WORKSPACE_ISOLATION.md), including its required SQL migration, before deploying this version. Existing shared documents/custom bases are retained exclusively in the original admin workspace. Other accounts start with empty built-in bases and their own custom bases. Admin has no HTTP access to other users' workspaces. Local CLI/Streamlit entrypoints operate on the original admin workspace.
 
 ## Verification
 

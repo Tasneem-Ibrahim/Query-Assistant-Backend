@@ -11,7 +11,7 @@ from urllib.parse import quote
 import httpx
 import pymupdf
 
-from . import config
+from . import config, workspace
 
 
 class CloudStorageError(RuntimeError):
@@ -84,6 +84,10 @@ def list_ingested(domain):
 
 
 def _object_path(path):
+    # Even service-role object reads must stay inside the verified workspace.
+    parts = path.split("/")
+    if len(parts) != 3 or not workspace.owns_namespace(parts[0]) or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("Document does not belong to this workspace.")
     return "/storage/v1/object/" + quote(config.SUPABASE_BUCKET, safe="") + "/" + quote(path, safe="/")
 
 
@@ -238,6 +242,7 @@ def delete_document(domain, digest):
     found = next((row for row in documents(domain.key) if row["file_hash"] == digest), None)
     if not found:
         raise KeyError(digest)
+    _object_path(found["object_path"])
     # SQL claim prevents deleting a PDF currently being processed.
     token = str(uuid.uuid4())
     args = {"p_namespace": config.embedding_namespace(), "p_domain": domain.key, "p_hash": digest, "p_token": token}

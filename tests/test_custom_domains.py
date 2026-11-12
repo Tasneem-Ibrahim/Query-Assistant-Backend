@@ -18,6 +18,12 @@ class CustomDomainsTests(unittest.TestCase):
         self.package.__path__ = []
         self.package.config = types.SimpleNamespace(DATA_DIR=self.root / "data", PDF_DIR=self.root / "pdfs")
         sys.modules[self.package.__name__] = self.package
+        name = self.package.__name__ + ".workspace"
+        spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] / "src/rag/workspace.py")
+        scope = importlib.util.module_from_spec(spec)
+        sys.modules[name] = scope
+        spec.loader.exec_module(scope)
+        self.package.workspace = scope
         self.module = self.load_module()
 
     def load_module(self):
@@ -30,6 +36,7 @@ class CustomDomainsTests(unittest.TestCase):
 
     def tearDown(self):
         sys.modules.pop(self.package.__name__ + ".domains", None)
+        sys.modules.pop(self.package.__name__ + ".workspace", None)
         sys.modules.pop(self.package.__name__, None)
         self.temp.cleanup()
 

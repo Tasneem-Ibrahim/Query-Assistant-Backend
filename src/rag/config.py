@@ -39,8 +39,10 @@ MAX_UPLOAD_BYTES = 4_000_000  # Leave room for multipart headers below Vercel's 
 
 
 def embedding_namespace() -> str:
+    from . import workspace
     identity = f"{EMBEDDING_API_URL}|{EMBEDDING_API_MODEL}|{EMBEDDING_DIMENSIONS}"
-    return "api_" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+    legacy = "api_" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+    return f"{legacy}_{workspace.suffix()}" if workspace.suffix() else legacy
 
 
 def configuration_errors() -> list[str]:
@@ -103,5 +105,6 @@ def tesseract_cmd() -> str | None:
 
 
 def ensure_dirs() -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    from . import workspace
+    workspace.cache_dir().mkdir(parents=True, exist_ok=True)
+    workspace.data_dir().mkdir(parents=True, exist_ok=True)

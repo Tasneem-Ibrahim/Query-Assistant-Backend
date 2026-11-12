@@ -18,7 +18,7 @@ from typing import Callable
 import pymupdf
 from PIL import Image, ImageOps
 
-from . import config
+from . import workspace, config
 from .ocr_refine import refine_ocr as _refine_ocr
 
 
@@ -205,7 +205,7 @@ def extract_pdf(
     config.ensure_dirs()
     pdf_path = Path(pdf_path)
     digest = file_sha256(pdf_path)
-    cache_file = config.CACHE_DIR / f"{digest}.ocr-v5.raw.json"
+    cache_file = workspace.cache_dir() / f"{digest}.ocr-v5.raw.json"
     if use_cache and cache_file.exists():
         if progress:
             progress("extraction loaded from cache")

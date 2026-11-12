@@ -7,7 +7,7 @@ def authenticated_api():
     async def authenticate(request):
         if request.cookies.get('qa_access') != 'test-access':
             raise HTTPException(401, 'Please sign in.')
-        request.state.user = {'id': 'test-user', 'name': 'Test User', 'email': 'test@example.com'}
+        request.state.user = {'id': 'local-admin', 'role': 'admin', 'name': 'Test Admin', 'email': ''}
         return request.state.user
     with patch('api_server.user_auth.configured', return_value=True), patch('api_server.user_auth.authenticate', side_effect=authenticate):
         yield

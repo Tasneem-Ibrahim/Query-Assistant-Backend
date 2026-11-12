@@ -71,7 +71,7 @@ vectors are not automatically migrated. Keep old collections until validation.
 A base name cannot be removed while another cloud embedding namespace still has
 documents in that base.
 
-Email/password accounts now use Supabase Auth. Complete [AUTH_SETUP.md](AUTH_SETUP.md), run `supabase/auth.sql`, set JWT expiry to 900 seconds, and enable Secure cookies. Use `SameSite=none` for unrelated frontend/backend sites (subject to browser third-party-cookie restrictions); prefer same-site hosting. RAG documents remain shared among signed-in users; profiles are private to their owner.
+Email/password accounts now use Supabase Auth. Complete [AUTH_SETUP.md](AUTH_SETUP.md), run `supabase/auth.sql`, set JWT expiry to 900 seconds, and enable Secure cookies. Use `SameSite=none` for unrelated frontend/backend sites (subject to browser third-party-cookie restrictions); prefer same-site hosting. RAG documents and profiles are private to their owner. Before deploying this version over an existing installation, run `supabase/workspace_isolation.sql` and follow [WORKSPACE_ISOLATION.md](WORKSPACE_ISOLATION.md). Existing data remains with admin; new users get separate empty workspaces.
 
 ## Validation
 

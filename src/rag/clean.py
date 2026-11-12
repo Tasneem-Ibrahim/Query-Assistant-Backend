@@ -20,7 +20,7 @@ import re
 from collections import Counter
 from typing import Callable
 
-from . import config, llm
+from . import workspace, config, llm
 
 PROMPT_VERSION = "v2"
 
@@ -169,14 +169,14 @@ def _valid(result: dict) -> list[dict] | None:
 def _load_cache() -> dict:
     if config.CLOUD_MODE:
         return {}
-    path = config.CACHE_DIR / "llm_cache.json"
+    path = workspace.cache_dir() / "llm_cache.json"
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
 def _save_cache(cache: dict) -> None:
     if config.CLOUD_MODE:
         return
-    (config.CACHE_DIR / "llm_cache.json").write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+    (workspace.cache_dir() / "llm_cache.json").write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 def clean_pages(

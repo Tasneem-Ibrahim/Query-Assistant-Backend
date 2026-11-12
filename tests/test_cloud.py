@@ -124,15 +124,17 @@ class CloudPipelineTests(unittest.TestCase):
 
     def test_preview_preserves_unicode_and_lines_in_pdf_only_bucket(self):
         text = "English and اردو\n<original OCR text>\nSecond line."
-        cloud._save_image_text("sample.pdf", text)
-        self.assertEqual(cloud.read_image_text("sample.pdf"), text)
-        self.assertIn(cloud._object_path("sample.pdf.ocr.pdf"), self.objects)
+        path = config.embedding_namespace() + "/customer_support/sample.pdf"
+        cloud._save_image_text(path, text)
+        self.assertEqual(cloud.read_image_text(path), text)
+        self.assertIn(cloud._object_path(path + ".ocr.pdf"), self.objects)
 
     def test_multipage_preview_retry_keeps_each_page_once(self):
-        cloud._save_image_text("scan.pdf", "First page", page=1)
-        cloud._save_image_text("scan.pdf", "Second page", page=2)
-        cloud._save_image_text("scan.pdf", "Second page", page=2)
-        text = cloud.read_image_text("scan.pdf")
+        path = config.embedding_namespace() + "/customer_support/scan.pdf"
+        cloud._save_image_text(path, "First page", page=1)
+        cloud._save_image_text(path, "Second page", page=2)
+        cloud._save_image_text(path, "Second page", page=2)
+        text = cloud.read_image_text(path)
         self.assertEqual(text, "Page 1\nFirst page\n\nPage 2\nSecond page")
 
     def test_multipage_tiff_cloud_processing_keeps_both_pages(self):
