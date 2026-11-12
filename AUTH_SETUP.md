@@ -47,7 +47,7 @@ Restart the backend and frontend after configuration. The frontend build needs o
 - The menu displays the user's name. Reload resumes the session using cookies. Once access expires, the next protected request refreshes and retries automatically. Concurrent requests in a tab share the refresh request.
 - Sign out revokes the Supabase refresh session and removes cookies. An expired or altered absolute-session cookie requires a fresh sign-in.
 
-RAG workspaces are now private to each account. Complete [WORKSPACE_ISOLATION.md](WORKSPACE_ISOLATION.md), including its required SQL migration, before deploying this version. Existing shared documents/custom bases are retained exclusively in the original admin workspace. Other accounts start with empty built-in bases and their own custom bases. Admin has no HTTP access to other users' workspaces. Local CLI/Streamlit entrypoints operate on the original admin workspace.
+RAG workspaces are now private to each account. Complete [WORKSPACE_ISOLATION.md](WORKSPACE_ISOLATION.md), including its required SQL migration, before deploying this version. Existing shared documents/custom bases are retained exclusively in the original admin workspace. Other accounts start with no knowledge bases or documents; Customer Support and Legal Assistant are admin-only. Users create their own custom bases. A first-visit welcome guide stores its presentation preference in Supabase Auth user metadata; no additional SQL migration is needed. Admin has no HTTP access to other users' workspaces. Local CLI/Streamlit entrypoints operate on the original admin workspace.
 
 ## Verification
 

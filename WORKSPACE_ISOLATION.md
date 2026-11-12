@@ -24,6 +24,16 @@ No new environment variables or API keys are needed. Existing `.env`, `.env.verc
 
 This is application-enforced ownership with backend-only database access, not user-token RLS on `qa_documents`: the service role bypasses RLS, and namespace enforcement is therefore essential. A leaked service-role/Qdrant credential can bypass application ownership. No live SQL execution or deployment is implied by the files in this repository. Local CLI/Streamlit remain trusted admin tools rather than multi-user HTTP interfaces.
 
+## Fresh workspaces and welcome guide
+
+Regular users receive only their own custom bases. A brand-new account receives `[]` from `/api/domains`; built-in routes are admin-only, including direct API URLs. Admin and trusted local CLI/Streamlit retain both built-ins. No data is deleted. Any regular-account uploads previously made inside built-in bases remain stored in their prior private namespace but are not automatically moved to custom bases or exposed through the now admin-only routes.
+
+The frontend accepts an empty list as a connected workspace. **New knowledge base** stays enabled; upload is enabled after creating/selecting a base. An accessible card guides the user through creating a base, uploading a PDF/image and asking/searching. Its main action opens the creation form. Close, Escape and **I'll explore first** acknowledge the guide without creating anything.
+
+`POST /api/auth/onboarding/complete` requires the authenticated session and CSRF protection. It updates only `workspace_guide_seen=true` through the signed-in user's Supabase `/user` endpoint. Profile/session responses expose `onboarding_seen`. This is a presentation preference, never an ownership/role authority. Other metadata is preserved ([Supabase metadata updates](https://supabase.com/docs/reference/javascript/auth-updateuser)). Completion persists with the account across sessions/devices; failed saves allow retry, and session changes discard pending UI actions. Existing custom-base users and admin are not interrupted by the empty-workspace guide.
+
+This follow-up needs no new environment values or SQL migration beyond the original workspace migration. Deploy both projects. Live Supabase metadata persistence still needs verification; automated tests use mocked providers.
+
 ## Verification
 
 `tests/test_workspace_isolation.py` tests local mode and cloud mode (mocked Supabase REST/auth, real temporary PDF parsing and Qdrant): legacy admin data, empty new accounts, direct foreign URLs, metadata/preview/delete/search/ask boundaries, identical PDFs, concurrent accounts, duplicate base names, invalid identities and missing-migration failure. These are offline tests, not a live Supabase migration or production isolation audit.

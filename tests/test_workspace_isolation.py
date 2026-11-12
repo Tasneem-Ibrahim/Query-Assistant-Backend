@@ -191,12 +191,13 @@ class LocalWorkspaceTests(unittest.TestCase):
             response = self.req(identity, 'GET', '/domains')
             self.assertEqual(response.status_code, 200, response.text)
             self.assertNotIn(custom.key, [d['key'] for d in response.json()])
-            status = self.req(identity, 'GET', '/domains/customer_support/status').json()
-            self.assertEqual(status['files'], {})
-            self.assertEqual(status['chunks'], 0)
+            self.assertEqual(response.json(), [])
+            for builtin in ('customer_support', 'legal_assistant'):
+                self.assertEqual(self.req(identity, 'GET', f'/domains/{builtin}/status').status_code, 404)
             with as_user(user):
                 self.assertNotEqual(config.embedding_namespace(), original_namespace)
-                self.assertNotEqual(get_domain('customer_support').collection, original_collection)
+                with self.assertRaises(ValueError):
+                    get_domain('customer_support')
         with as_user(ADMIN):
             self.assertEqual(get_domain(custom.key).label, 'Admin private base')
             self.assertEqual(config.embedding_namespace(), original_namespace)
@@ -215,28 +216,42 @@ class LocalWorkspaceTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 404, (identity, method, suffix, response.text))
         self.assertEqual(self.req('alice', 'GET', f'/domains/{key}/documents/{digest}/pdf').content, self.pdf)
 
-    def test_builtin_ids_and_identical_files_are_scoped_including_vectors(self):
-        digest = self.upload('alice')
-        root = f'/domains/customer_support/documents/{digest}'
-        for method, suffix in [('GET', '/pdf'), ('GET', '/text'), ('DELETE', '')]:
-            response = self.req('bob', method, root + suffix)
-            self.assertEqual(response.status_code, 404, response.text)
-        step = self.req('bob', 'POST', root + '/step')
-        self.assertIn(step.status_code, (400, 404))
-        search = self.req('bob', 'POST', '/domains/customer_support/search', json={'query': 'mango'})
-        self.assertEqual(search.json()['hits'], [])
-        ask = self.req('bob', 'POST', '/domains/customer_support/ask', json={'question': 'mango'})
-        self.assertEqual(ask.json()['sources'], [])
-        self.assertEqual(self.upload('bob'), digest)
-        self.assertTrue(self.req('alice', 'POST', '/domains/customer_support/search', json={'query': 'mango'}).json()['hits'])
+    def test_empty_custom_bases_and_identical_files_are_scoped_including_vectors(self):
+        keys = {identity: self.req(identity, 'POST', '/domains', json={'name': 'My documents'}).json()['key']
+                for identity in ('alice', 'bob')}
+        alice, bob = keys['alice'], keys['bob']
+        digest = self.upload('alice', alice)
+        root = f'/domains/{alice}/documents/{digest}'
+        for method, suffix in [('GET', '/pdf'), ('GET', '/text'), ('DELETE', ''), ('POST', '/step')]:
+            self.assertEqual(self.req('bob', method, root + suffix).status_code, 404)
+        status = self.req('bob', 'GET', f'/domains/{bob}/status').json()
+        self.assertEqual(status['files'], {})
+        self.assertEqual(status['chunks'], 0)
+        self.assertEqual(self.req('bob', 'POST', f'/domains/{bob}/search', json={'query': 'mango'}).json()['hits'], [])
+        self.assertEqual(self.req('bob', 'POST', f'/domains/{bob}/ask', json={'question': 'mango'}).json()['sources'], [])
+        self.assertEqual(self.upload('bob', bob), digest)
+        self.assertTrue(self.req('alice', 'POST', f'/domains/{alice}/search', json={'query': 'mango'}).json()['hits'])
         self.assertEqual(self.req('alice', 'DELETE', root).status_code, 200)
-        self.assertEqual(self.req('bob', 'GET', root + '/pdf').content, self.pdf)
-        self.assertTrue(self.req('bob', 'POST', '/domains/customer_support/search', json={'query': 'mango'}).json()['hits'])
-        self.assertEqual(self.req('alice', 'GET', '/domains/customer_support/status').json()['files'], {})
+        self.assertEqual(self.req('bob', 'GET', f'/domains/{bob}/documents/{digest}/pdf').content, self.pdf)
+        self.assertTrue(self.req('bob', 'POST', f'/domains/{bob}/search', json={'query': 'mango'}).json()['hits'])
+        self.assertEqual(self.req('alice', 'GET', f'/domains/{alice}/status').json()['files'], {})
         if self.cloud_mode:
             namespaces = {r['namespace'] for r in self.storage.tables['qa_documents']}
             self.assertEqual(len(namespaces), 1)
             self.assertIn('user_' + BOB['id'].replace('-', ''), next(iter(namespaces)))
+
+    def test_builtin_routes_are_admin_only_and_users_can_choose_their_own_labels(self):
+        for key in ('customer_support', 'legal_assistant'):
+            for method, suffix, body in [('GET', '/status', None), ('POST', '/search', {'query': 'private'}),
+                                        ('POST', '/ask', {'question': 'private'}), ('POST', '/ingest', None)]:
+                response = self.req('alice', method, f'/domains/{key}' + suffix, **({'json': body} if body else {}))
+                self.assertEqual(response.status_code, 404, response.text)
+                self.assertNotIn('Choose one of', response.text)
+        response = self.req('alice', 'POST', '/domains', json={'name': 'Customer Support'})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertTrue(response.json()['key'].startswith('custom_'))
+        self.assertEqual(len(self.req('alice', 'GET', '/domains').json()), 1)
+        self.assertEqual(len(self.req('bob', 'GET', '/domains').json()), 0)
 
     def test_same_base_names_and_parallel_requests_do_not_share_registries(self):
         keys = {}
@@ -256,9 +271,10 @@ class LocalWorkspaceTests(unittest.TestCase):
     def test_image_ocr_previews_are_private(self):
         buffer = io.BytesIO()
         Image.new('RGB', (300, 200), 'white').save(buffer, format='PNG')
+        key = self.req('alice', 'POST', '/domains', json={'name': 'Images'}).json()['key']
         with patch('rag.extract.ocr_image', return_value='Private image transcript.'), patch.object(cloud, '_ocr_page', return_value='Private image transcript.'):
-            digest = self.upload('alice', name='private.png', content=buffer.getvalue())
-        path = f'/domains/customer_support/documents/{digest}/text'
+            digest = self.upload('alice', key, name='private.png', content=buffer.getvalue())
+        path = f'/domains/{key}/documents/{digest}/text'
         response = self.req('alice', 'GET', path)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()['text'], 'Private image transcript.')

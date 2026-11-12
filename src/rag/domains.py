@@ -136,7 +136,7 @@ def list_domains() -> list[Domain]:
     with _domain_lock:
         custom = _read_custom()
         # No process-global custom registry: concurrent accounts must never share it.
-        domains = [DOMAINS[key] for key in DOMAINS if key in _BUILTIN_KEYS]
+        domains = [DOMAINS[key] for key in DOMAINS if key in _BUILTIN_KEYS] if workspace.owner_id() == "admin" else []
         domains.extend(_custom_domain(key, label) for key, label in custom.items())
         if getattr(config, "CLOUD_MODE", False):
             domains = [replace(domain, collection=f"{config.embedding_namespace()}_{domain.key}") for domain in domains]
@@ -149,7 +149,7 @@ def _validate_label(label: str, custom: dict[str, str], excluding: str | None = 
     label = label.strip()
     if not label or len(label) > 80 or any(ord(c) < 32 for c in label):
         raise ValueError("Choose a name between 1 and 80 characters without control characters.")
-    names = [DOMAINS[key].label for key in _BUILTIN_KEYS]
+    names = [DOMAINS[key].label for key in _BUILTIN_KEYS] if workspace.owner_id() == "admin" else []
     names.extend(value for key, value in custom.items() if key != excluding)
     if any(name.casefold() == label.casefold() for name in names):
         raise ValueError("A knowledge base with this name already exists. Choose another name.")
@@ -189,7 +189,7 @@ def get_domain(key: str) -> Domain:
     try:
         return available[key]
     except KeyError:
-        raise ValueError(f"Unknown domain '{key}'. Choose one of: {', '.join(DOMAINS)}") from None
+        raise ValueError("Knowledge base not found in your workspace.") from None
 
 
 def delete_domain(key: str) -> None:

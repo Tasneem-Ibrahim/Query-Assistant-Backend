@@ -34,6 +34,8 @@ class LocalAdminTests(unittest.TestCase):
         response = self.login()
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()['user']['role'], 'admin')
+        self.assertTrue(response.json()['user']['onboarding_seen'])
+        self.assertEqual(self.client.post('/api/auth/onboarding/complete', headers=HEADERS).status_code, 200)
         self.assertEqual(response.json()['expires_in'], 900)
         self.assertNotIn('original-password', response.text)
         self.assertEqual(self.client.get('/api/auth/session').json()['user']['name'], 'Admin')

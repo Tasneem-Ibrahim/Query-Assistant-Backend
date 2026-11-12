@@ -93,7 +93,8 @@ def claims(token):
 def profile(user):
     return {"id": user["id"], "email": user.get("email", ""),
             "name": user.get("user_metadata", {}).get("name") or user.get("email", "User"),
-            "role": "admin" if user.get("_local_admin") is True else "user"}
+            "role": "admin" if user.get("_local_admin") is True else "user",
+            "onboarding_seen": user.get("_local_admin") is True or user.get("user_metadata", {}).get("workspace_guide_seen") is True}
 
 
 async def authenticate(request):
@@ -206,6 +207,16 @@ async def refresh(request: Request, response: Response):
 @router.get("/session")
 async def session(request: Request):
     return {"user": request.state.user}
+
+
+@router.post("/onboarding/complete")
+async def complete_onboarding(request: Request):
+    # Presentation preference only: never use editable metadata for authorization.
+    if request.state.user["role"] == "admin":
+        return {"ok": True}
+    await provider("PUT", "/user", token=request.cookies[ACCESS],
+                   body={"data": {"workspace_guide_seen": True}})
+    return {"ok": True}
 
 
 @router.post("/logout")

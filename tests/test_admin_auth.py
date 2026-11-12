@@ -1,5 +1,6 @@
 """Authentication contracts: Supabase password flow, cookies, expiry, CSRF and RAG gate."""
 import base64
+import copy
 import json
 import sys
 import time
@@ -32,6 +33,7 @@ class UserAuthTests(unittest.TestCase):
         settings.start()
         self.addCleanup(settings.stop)
         self.provider_calls = []
+        self.user = copy.deepcopy(USER)
         self.counter = 0
         self.confirmation = False
         self.old_token = False
@@ -42,16 +44,18 @@ class UserAuthTests(unittest.TestCase):
             if self.fail_network:
                 raise httpx.ConnectError('private diagnostic')
             if url.endswith('/user'):
-                return httpx.Response(200, json=USER)
+                if method == 'PUT':
+                    self.user['user_metadata'].update(kwargs['json']['data'])
+                return httpx.Response(200, json=self.user)
             if '/logout?' in url:
                 return httpx.Response(204)
             if self.fail_login:
                 return httpx.Response(400, json={'error_code': 'invalid_credentials'})
             if url.endswith('/signup') and self.confirmation:
-                return httpx.Response(200, json=USER)
+                return httpx.Response(200, json=self.user)
             self.counter += 1
             return httpx.Response(200, json={'access_token': token(age=901 if self.old_token else 0, lifetime=3600),
-                'refresh_token': 'refresh-' + str(self.counter), 'user': USER, 'expires_in': 3600})
+                'refresh_token': 'refresh-' + str(self.counter), 'user': self.user, 'expires_in': 3600})
         transport = patch.object(user_auth._client, 'request', side_effect=provider)
         transport.start()
         self.addCleanup(transport.stop)
@@ -165,6 +169,31 @@ class UserAuthTests(unittest.TestCase):
     def test_missing_configuration_fails_closed(self):
         with patch.object(config, 'AUTH_COOKIE_SECRET', ''):
             self.assertEqual(self.login().status_code, 503)
+
+    def test_welcome_completion_persists_on_account_and_preserves_profile(self):
+        self.assertFalse(self.login().json()['user']['onboarding_seen'])
+        self.assertFalse(self.client.get('/api/auth/session').json()['user']['onboarding_seen'])
+        response = self.client.post('/api/auth/onboarding/complete', headers=CSRF,
+                                    json={'owner_id': 'someone-else'})
+        self.assertEqual(response.status_code, 200, response.text)
+        update = next(c for c in self.provider_calls if c[0] == 'PUT')
+        self.assertEqual(update[2]['json'], {'data': {'workspace_guide_seen': True}})
+        self.assertEqual(update[2]['headers']['Authorization'], 'Bearer ' + self.client.cookies.get(user_auth.ACCESS))
+        profile = self.client.get('/api/auth/session').json()['user']
+        self.assertTrue(profile['onboarding_seen'])
+        self.assertEqual(profile['name'], USER['user_metadata']['name'])
+        self.assertEqual(profile['role'], 'user')
+        self.assertTrue(self.login().json()['user']['onboarding_seen'])
+        # A different account has independent metadata, even in the same browser.
+        self.user = {**copy.deepcopy(USER), 'id': '22222222-2222-4222-8222-222222222222'}
+        self.assertFalse(self.login().json()['user']['onboarding_seen'])
+
+    def test_welcome_completion_requires_session_and_csrf(self):
+        self.assertEqual(self.client.post('/api/auth/onboarding/complete', headers=CSRF).status_code, 401)
+        self.assertFalse(self.provider_calls)
+        self.login()
+        self.assertEqual(self.client.post('/api/auth/onboarding/complete').status_code, 403)
+        self.assertFalse(self.user['user_metadata'].get('workspace_guide_seen'))
 
 
 if __name__ == '__main__':
