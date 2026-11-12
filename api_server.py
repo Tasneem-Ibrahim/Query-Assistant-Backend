@@ -32,9 +32,10 @@ from pydantic import BaseModel  # noqa: E402
 from rag import answer, config, ingest, extract  # noqa: E402
 from rag.domains import create_domain, delete_domain, get_domain, list_domains, rename_domain  # noqa: E402
 from rag.cloud import CloudStorageError  # noqa: E402
-from rag import admin_auth  # noqa: E402
+from rag import user_auth  # noqa: E402
 
 app = FastAPI(title="Query Assistant API", version="1.0")
+app.include_router(user_auth.router)
 
 
 @app.exception_handler(CloudStorageError)
@@ -43,27 +44,27 @@ async def storage_error_handler(request, exc):
     return JSONResponse(status_code=502, content={"detail": str(exc)})
 
 @app.middleware("http")
-async def require_admin(request, call_next):
-    # Protect every route, including new routes and API documentation.
+async def require_user(request, call_next):
+    # Protect every RAG route, including future routes and API documentation.
     if request.method != "OPTIONS":
-        if not admin_auth.configured():
-            return JSONResponse(status_code=503, content={"detail": "Admin login is not configured. Set ADMIN_PASSWORD on the backend."}, headers={"Cache-Control": "no-store"})
-        if not admin_auth.authorized(request.headers.get("authorization", "")):
-            return JSONResponse(status_code=401, content={"detail": "Admin name or password is incorrect. Please sign in."}, headers={"Cache-Control": "no-store"})
+        try:
+            if not user_auth.configured():
+                raise HTTPException(503, "Supabase authentication is not configured on the backend.")
+            user_auth.check_origin(request)
+            if request.url.path not in user_auth.PUBLIC_PATHS:
+                await user_auth.authenticate(request)
+        except HTTPException as exc:
+            return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers={"Cache-Control": "no-store"})
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
     return response
-
-
-@app.get("/api/auth/session")
-def admin_session():
-    return {"name": config.ADMIN_USERNAME}
 
 
 # CORS runs outside authentication so preflight and login errors remain readable.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -17,6 +17,13 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 CLOUD_MODE = os.getenv("STORAGE_BACKEND", "supabase" if os.getenv("VERCEL") else "local") == "supabase"
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+# The fallback stays on the server; never send either secret to the frontend.
+AUTH_COOKIE_SECRET = os.getenv("AUTH_COOKIE_SECRET", "") or SUPABASE_SERVICE_ROLE_KEY
+AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true" if os.getenv("VERCEL") else "false").lower() == "true"
+AUTH_COOKIE_SAMESITE = os.getenv("AUTH_COOKIE_SAMESITE", "lax").lower()
+AUTH_ACCESS_SECONDS = 900
+AUTH_SESSION_SECONDS = 7 * 24 * 60 * 60
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "knowledge-pdfs")
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "api" if CLOUD_MODE else "local")
 EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "")
@@ -26,6 +33,7 @@ EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "0") or "0")
 OCR_API_URL = os.getenv("OCR_API_URL", "https://api.mistral.ai/v1/ocr")
 OCR_API_KEY = os.getenv("OCR_API_KEY", "")
 OCR_API_MODEL = os.getenv("OCR_API_MODEL", "mistral-ocr-latest")
+# Local browser hosts must be listed explicitly; localhost and 127.0.0.1 are distinct origins.
 CORS_ORIGINS = [value.strip() for value in os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",") if value.strip()]
 MAX_UPLOAD_BYTES = 4_000_000  # Leave room for multipart headers below Vercel's request limit.
 

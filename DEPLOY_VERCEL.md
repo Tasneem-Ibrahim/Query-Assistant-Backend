@@ -71,9 +71,7 @@ vectors are not automatically migrated. Keep old collections until validation.
 A base name cannot be removed while another cloud embedding namespace still has
 documents in that base.
 
-This preserves the app's shared-workspace access model. It does not add accounts
-or per-user authorization; use the deployment access controls appropriate for
-your workspace. CORS is browser configuration, not login.
+Email/password accounts now use Supabase Auth. Complete [AUTH_SETUP.md](AUTH_SETUP.md), run `supabase/auth.sql`, set JWT expiry to 900 seconds, and enable Secure cookies. Use `SameSite=none` for unrelated frontend/backend sites (subject to browser third-party-cookie restrictions); prefer same-site hosting. RAG documents remain shared among signed-in users; profiles are private to their owner.
 
 ## Validation
 

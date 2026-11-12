@@ -51,7 +51,7 @@ Customer Support and Legal Assistant are **personas using the same configured mo
 flowchart TB
     User[User] --> UI[Browser workspace]
     UI -->|Authenticated HTTP| API[FastAPI backend]
-    API --> Auth[Admin credential verification]
+    API --> Auth[Supabase user session verification]
     API --> Extract[PyMuPDF + Pillow + OCR]
     Extract --> Raw[Raw image OCR preview]
     Extract --> Clean[Cleanup and optional DeepSeek normalization]
@@ -73,7 +73,7 @@ flowchart TB
 
 | Step | Component | Input → output / purpose |
 | --- | --- | --- |
-| 1. Authenticate and select | Middleware + `domains.py` | Admin credentials and knowledge-base key → selected workspace |
+| 1. Authenticate and select | Middleware + `domains.py` | User session and knowledge-base key → selected workspace |
 | 2. Validate | `api_server.py`, `extract.py` | File → checked extension, actual readability, size and decoding limits |
 | 3. Identify | SHA-256 | Original file bytes → content hash for duplicate detection |
 | 4. Extract | PyMuPDF + Tesseract, or configured OCR API | Digital text/images/scans → page-numbered text |
@@ -126,7 +126,7 @@ Provider secrets are read **only by the backend** from `.env` or server environm
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase | `cloud.py`, indirectly domain persistence | Server access to metadata, private files and processing RPCs | `STORAGE_BACKEND=supabase`; use the configured service-role credential, not a browser anon key |
 | `QDRANT_API_KEY` | Remote Qdrant | `vectorstore.py` | Authenticate vector writes, search and deletion | Remote instance requires credentials |
 | `OCR_API_KEY` | Mistral-compatible OCR provider | `cloud.py` | Authenticate remote OCR | Cloud API OCR only; not required for Tesseract |
-| `ADMIN_USERNAME` + `ADMIN_PASSWORD` | Application login | `admin_auth.py`, API middleware | Verify HTTP Basic credentials | All application HTTP access; not a provider API key |
+| `SUPABASE_ANON_KEY` + `AUTH_COOKIE_SECRET` | Application login | `user_auth.py`, API middleware | Supabase Auth and signed cookie sessions | Backend only; see [AUTH_SETUP.md](AUTH_SETUP.md) |
 | No API key | Tesseract | `extract.py` | Host OCR inference | Executable, `pytesseract` and language data required |
 | No API key | Local Sentence Transformers | `embed.py` | Local embedding inference | Local dependencies and initial model availability required |
 
@@ -134,9 +134,9 @@ Service URLs identify endpoints; they do not replace credentials. A DeepSeek key
 
 ### Authentication and browser session
 
-Every application route, including health and API documentation, is protected. CORS preflight is allowed. Missing admin configuration returns HTTP 503; invalid/missing credentials return HTTP 401. Use HTTPS when deployed.
+Every RAG route, including health and API documentation, is protected. Admin login, user signup/login/refresh/logout and CORS preflight are reachable before login. Missing Auth configuration returns HTTP 503; invalid/expired sessions return HTTP 401. Use HTTPS when deployed.
 
-The frontend sends HTTP Basic credentials and saves a backend-scoped tab session in `sessionStorage`, allowing login to resume on refresh. Logout clears it. This is a single-admin workspace, not a multi-user account system; collection isolation does not constitute per-user authorization.
+Existing admin credentials in `.env` work through **Admin sign in**, without a Supabase account. Supabase Auth manages other users? email/password accounts and password hashes. HttpOnly cookies hold the access JWT (15-minute app limit) and rotating refresh token; a signed session deadline enforces seven days. Logout revokes the refresh session and clears cookies. Profiles live in `public.users` with row-level security. RAG knowledge bases remain shared among signed-in users. Complete the required [authentication setup](AUTH_SETUP.md), including the SQL migration and Supabase JWT expiry setting.
 
 ## Supported files and OCR preview
 
@@ -185,7 +185,7 @@ python -m venv .venv
 Copy-Item .env.example .env
 ```
 
-Copy the example only for a **new installation**; retain an existing configured `.env`. Configure admin credentials, `DEEPSEEK_API_KEY` and Tesseract. For local storage, select:
+Copy the example only for a **new installation**; retain an existing configured `.env`. Complete [authentication setup](AUTH_SETUP.md), then configure `DEEPSEEK_API_KEY` and Tesseract. For local storage, select:
 
 ```dotenv
 STORAGE_BACKEND=local
@@ -205,7 +205,7 @@ On macOS/Linux, create/activate a virtual environment, install the same requirem
 
 ### Supabase setup
 
-Use `.env.cloud.example` as a configuration reference. Run [supabase/setup.sql](supabase/setup.sql) in the intended project; configure private storage, embedding API, remote Qdrant and admin credentials. On a Tesseract host install `requirements-local.txt` and select `OCR_PROVIDER=tesseract`; otherwise configure `OCR_API_KEY`. See [DEPLOY_VERCEL.md](DEPLOY_VERCEL.md) for cloud deployment.
+Use `.env.cloud.example` as a configuration reference. Run [supabase/setup.sql](supabase/setup.sql) in the intended project; configure private storage, embedding API, remote Qdrant and [Supabase authentication](AUTH_SETUP.md). On a Tesseract host install `requirements-local.txt` and select `OCR_PROVIDER=tesseract`; otherwise configure `OCR_API_KEY`. See [DEPLOY_VERCEL.md](DEPLOY_VERCEL.md) for cloud deployment.
 
 | Resource | Development URL |
 | --- | --- |
@@ -246,11 +246,16 @@ Secret variables are documented in the credentials table. Passage and query vect
 
 ## API reference
 
-All application routes require admin authentication.
+All RAG routes require a user session. Auth mutations require `X-CSRF-Protection: 1` and an allowed browser origin.
 
 | Method | Endpoint | Purpose |
 | --- | --- | --- |
-| GET | `/api/auth/session` | Verify credentials / resume login |
+| POST | `/api/auth/admin/login` | Existing admin username/password login |
+| POST | `/api/auth/signup` | Create name/email/password account |
+| POST | `/api/auth/login` | Sign in and set HttpOnly cookies |
+| POST | `/api/auth/refresh` | Rotate refresh token and renew access |
+| POST | `/api/auth/logout` | Revoke session and clear cookies |
+| GET | `/api/auth/session` | Return the authenticated user profile |
 | GET | `/api/health` | Configuration flags; not a complete service connectivity check |
 | GET | `/api/domains` | List built-in/custom bases |
 | POST | `/api/domains` | Create base with `{"name":"Research Notes"}` |
@@ -304,7 +309,7 @@ Query-Assistant-backend/
 ├── cli.py                 # Command-line interface
 ├── src/rag/
 │   ├── config.py          # Environment configuration
-│   ├── admin_auth.py      # Admin credential verification
+│   ├── user_auth.py       # Supabase Auth and cookie sessions
 │   ├── domains.py         # Personas and custom bases
 │   ├── extract.py         # Validation, image decoding, PDF extraction, OCR
 │   ├── clean.py           # Rule-based / LLM normalization
@@ -351,7 +356,7 @@ Standalone `test_pipeline_offline.py` and `test_app_offline.py` provide sample-d
 | Pending document | Resolve reported error and use **Resume saved documents**; a processing lease may need to expire |
 | Old cloud image lacks preview | Older indexed files may predate persistence; delete/re-upload that image if needed |
 | Search works, answers fail | Check DeepSeek settings, network access and quota |
-| HTTP 401 / 503 | Check admin login / required backend admin configuration |
+| HTTP 401 / 503 | Check user login / Supabase Auth configuration; see AUTH_SETUP.md |
 | Qdrant already in use | Stop another process using the embedded folder |
 | Frontend cannot connect | Check origin, HTTPS and `CORS_ORIGINS` |
 | Controls disabled | Select a base; complete ingestion before asking questions |

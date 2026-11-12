@@ -1,5 +1,5 @@
 """PDF previews require authentication and domain membership."""
-import base64
+from auth_helpers import authenticated_api
 import sys
 import tempfile
 import unittest
@@ -14,10 +14,13 @@ from rag import cloud, config, extract, ingest
 
 class PdfPreviewTests(unittest.TestCase):
     def setUp(self):
-        self.settings = patch.multiple(config, CLOUD_MODE=False, ADMIN_USERNAME="Admin", ADMIN_PASSWORD="test-password")
+        self.auth = authenticated_api()
+        self.auth.__enter__()
+        self.addCleanup(self.auth.__exit__, None, None, None)
+        self.settings = patch.object(config, "CLOUD_MODE", False)
         self.settings.start()
         self.addCleanup(self.settings.stop)
-        self.headers = {"Authorization": "Basic " + base64.b64encode(b"Admin:test-password").decode()}
+        self.headers = {"Cookie": "qa_access=test-access"}
 
     def test_local_preview_and_access_checks(self):
         with tempfile.TemporaryDirectory() as directory:

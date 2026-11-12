@@ -242,12 +242,11 @@ class CloudAPITests(unittest.TestCase):
         import api_server
 
         self.server = api_server
-        import base64
-        auth_settings = patch.multiple(config, ADMIN_USERNAME="Admin", ADMIN_PASSWORD="test-password")
-        auth_settings.start()
-        self.addCleanup(auth_settings.stop)
-        token = base64.b64encode(b"Admin:test-password").decode()
-        self.client = TestClient(api_server.app, headers={"Authorization": "Basic " + token})
+        from auth_helpers import authenticated_api
+        self.auth = authenticated_api()
+        self.auth.__enter__()
+        self.addCleanup(self.auth.__exit__, None, None, None)
+        self.client = TestClient(api_server.app, headers={"Cookie": "qa_access=test-access", "X-CSRF-Protection": "1"})
         self.cloud_mode = patch.object(config, "CLOUD_MODE", True)
         self.cloud_mode.start()
         self.domain_patch = patch.object(api_server, "get_domain", return_value=Mock(key="customer_support"))

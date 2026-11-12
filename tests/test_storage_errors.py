@@ -14,12 +14,10 @@ from rag import cloud, config
 
 class StorageErrorTests(unittest.TestCase):
     def setUp(self):
-        self.auth = patch('api_server.admin_auth.authorized', return_value=True)
-        self.auth.start()
-        self.configured = patch('api_server.admin_auth.configured', return_value=True)
-        self.configured.start()
-        self.addCleanup(self.auth.stop)
-        self.addCleanup(self.configured.stop)
+        from auth_helpers import authenticated_api
+        self.auth = authenticated_api()
+        self.auth.__enter__()
+        self.addCleanup(self.auth.__exit__, None, None, None)
 
     def test_connection_failure_is_safe_json_with_cors(self):
         origin = config.CORS_ORIGINS[0]
@@ -27,7 +25,7 @@ class StorageErrorTests(unittest.TestCase):
              patch.object(config, 'SUPABASE_SERVICE_ROLE_KEY', 'private-key'), \
              patch.object(cloud._client, 'request', side_effect=httpx.ConnectError('private diagnostic')), \
              patch.object(api_server, 'list_domains', side_effect=lambda: cloud.rows('qa_domains')):
-            response = TestClient(api_server.app).get('/api/domains', headers={'Origin': origin})
+            response = TestClient(api_server.app).get('/api/domains', headers={'Origin': origin, 'Cookie': 'qa_access=test-access'})
         self.assertEqual(response.status_code, 502)
         self.assertEqual(response.headers['access-control-allow-origin'], origin)
         self.assertIn('Cannot reach Supabase', response.json()['detail'])

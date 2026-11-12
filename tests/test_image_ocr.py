@@ -108,14 +108,14 @@ class ImageOCRTests(unittest.TestCase):
                     vectorstore.close_client()
 
     def test_preview_endpoint_returns_raw_text_and_checks_domain_membership(self):
-        import base64
+        from auth_helpers import authenticated_api
         import api_server
         from fastapi.testclient import TestClient
         from rag import ingest
         digest = "a" * 64
         text = "<script>original OCR text</script>\nThirty days."
-        headers = {"Authorization": "Basic " + base64.b64encode(b"Admin:test-password").decode()}
-        with patch.multiple(config, CLOUD_MODE=False, ADMIN_USERNAME="Admin", ADMIN_PASSWORD="test-password"), patch.object(api_server, "_domain"), patch.object(ingest, "list_ingested", return_value={digest: {"name": "notes.png", "extracted_text": text}}):
+        headers = {"Cookie": "qa_access=test-access"}
+        with authenticated_api(), patch.object(config, "CLOUD_MODE", False), patch.object(api_server, "_domain"), patch.object(ingest, "list_ingested", return_value={digest: {"name": "notes.png", "extracted_text": text}}):
             with TestClient(api_server.app) as client:
                 path = f"/api/domains/example/documents/{digest}/text"
                 self.assertEqual(client.get(path).status_code, 401)
