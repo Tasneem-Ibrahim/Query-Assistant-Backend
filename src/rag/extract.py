@@ -73,6 +73,12 @@ def _ocr_variants(img: Image.Image):
     import numpy as np
     from PIL import ImageFilter
 
+    values = np.asarray(img)
+    # Posters/photos can have light lettering over dark, textured backgrounds.
+    # Keep this alternative away from ordinary white paper and confident pages.
+    if .005 < np.mean(values > 200) < .3 and np.mean(values < 150) > .4:
+        yield Image.fromarray(np.where(values > 200, 0, 255).astype('uint8'))
+
     enhanced = _deskew(img.filter(ImageFilter.MedianFilter(3)))
     enhanced = ImageOps.autocontrast(enhanced, cutoff=1).filter(
         ImageFilter.UnsharpMask(radius=1.5, percent=160, threshold=3))
@@ -127,13 +133,17 @@ def _prefer_ocr(candidate, current) -> bool:
     an existing result. Never prefer output merely because it is longer.
     """
     coverage = min(1.0, candidate[3] / max(current[3], 1))
+    # A long stream of low-confidence scenery symbols is not text coverage.
+    if current[2] < 40 and candidate[2] >= 60 and candidate[1] >= 80:
+        return True
     return candidate[2] * coverage > current[2] + 2
 
 
 def ocr_image(img: Image.Image, psm: int | None = None) -> str:
     """Adaptive local OCR; preserve the baseline unless a retry scores better.
 
-    At most six page OCR calls plus eight targeted line calls. Explicit layout
+    At most eight page OCR calls plus eight targeted line calls and two footer
+    verification calls when uncovered visual content exists. Explicit layout
     modes participate in preprocessing retries; sparse layout is only tried
     when the baseline is weak.
     """
@@ -205,7 +215,7 @@ def extract_pdf(
     config.ensure_dirs()
     pdf_path = Path(pdf_path)
     digest = file_sha256(pdf_path)
-    cache_file = workspace.cache_dir() / f"{digest}.ocr-v5.raw.json"
+    cache_file = workspace.cache_dir() / f"{digest}.ocr-v7.raw.json"
     if use_cache and cache_file.exists():
         if progress:
             progress("extraction loaded from cache")

@@ -10,7 +10,7 @@ import time
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from . import config, admin_sessions
 
@@ -38,7 +38,7 @@ def check_origin(request: Request):
 
 async def provider(method, path, *, body=None, token=None):
     if not config.SUPABASE_URL or not (config.SUPABASE_ANON_KEY or config.SUPABASE_SERVICE_ROLE_KEY):
-        raise HTTPException(503, "User signup/login requires Supabase configuration. Admin can use Admin sign in.")
+        raise HTTPException(503, "User signup/login requires Supabase configuration. Administrators can sign in with their configured username.")
     key = config.SUPABASE_ANON_KEY or config.SUPABASE_SERVICE_ROLE_KEY
     headers = {"apikey": key}
     if token:
@@ -174,6 +174,12 @@ class AdminLoginBody(BaseModel):
     password: str = Field(min_length=1, max_length=256)
 
 
+class UnifiedLoginBody(BaseModel):
+    # Keep existing email-based clients compatible; UI uses one identity field.
+    identity: str = Field(min_length=1, max_length=254, validation_alias=AliasChoices("identity", "email"))
+    password: str = Field(min_length=1, max_length=256)
+
+
 @router.post("/admin/login")
 async def admin_login(body: AdminLoginBody, response: Response):
     data, deadline = admin_sessions.create(body.username.strip(), body.password)
@@ -190,9 +196,21 @@ async def signup(body: SignupBody, response: Response):
 
 
 @router.post("/login")
-async def login(body: LoginBody, response: Response):
-    data = await provider("POST", "/token?grant_type=password", body=body.model_dump())
-    return save_session(response, data)
+async def login(body: UnifiedLoginBody, response: Response):
+    identity = body.identity.strip()
+    try:
+        if hmac.compare_digest(identity.encode(), config.ADMIN_USERNAME.encode()):
+            data, deadline = admin_sessions.create(identity, body.password)
+            return save_session(response, data, deadline)
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", identity):
+            raise HTTPException(401, "Invalid credentials.")
+        data = await provider("POST", "/token?grant_type=password",
+                              body={"email": identity, "password": body.password})
+        return save_session(response, data)
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            raise HTTPException(401, "Email or username, or password is incorrect.") from None
+        raise
 
 
 @router.post("/refresh")

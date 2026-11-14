@@ -23,7 +23,7 @@ AUTH_COOKIE_SECURE=false
 AUTH_COOKIE_SAMESITE=lax
 ```
 
-Generate a secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Keep it stable across workers and restarts. If omitted, the existing backend-only service-role key signs the session deadline. Auth requests use the anon/publishable key when set, otherwise the existing service-role key remains server-side as the API key. Never put a service-role key in frontend configuration. `ADMIN_USERNAME`/`ADMIN_PASSWORD` retain the existing admin credentials. Choose **Admin sign in** and enter that username/password; normal users continue to use Supabase email/password accounts.
+Generate a secret with `python -c "import secrets; print(secrets.token_urlsafe(48))"`. Keep it stable across workers and restarts. If omitted, the existing backend-only service-role key signs the session deadline. Auth requests use the anon/publishable key when set, otherwise the existing service-role key remains server-side as the API key. Never put a service-role key in frontend configuration. `ADMIN_USERNAME`/`ADMIN_PASSWORD` retain the existing admin credentials. Use the shared **Email or Username** form: administrators enter their configured username; normal users enter their Supabase email/password.
 
 For HTTPS deployment set `AUTH_COOKIE_SECURE=true`, and set exact frontend origins in `CORS_ORIGINS`. For unrelated frontend/backend sites, set `AUTH_COOKIE_SAMESITE=none` as well. Browsers may block third-party cookies: deploy behind one origin or use frontend/backend subdomains on the same site for reliable production sessions. Cookies are host-only, HttpOnly, and scoped to `/api`; the refresh endpoint never returns token values to JavaScript. Protected changes require a CSRF header and an allowed Origin.
 
@@ -57,6 +57,34 @@ References: [Supabase user data](https://supabase.com/docs/guides/auth/managing-
 
 ## Existing admin access
 
-The login screen includes **Admin sign in**. Admin uses the original `ADMIN_USERNAME` and `ADMIN_PASSWORD` restored in the local `.env`; no Supabase signup is required. `POST /api/auth/admin/login` creates a signed 15-minute JWT and a seven-day refresh session, with only a keyed hash of the refresh token stored in `DATA_DIR/admin_sessions.sqlite3`. Refresh rotates the token; logout revokes the session; changing the admin credentials invalidates existing admin sessions. Normal user signup/login still uses Supabase Auth and the `public.users` profile trigger.
+The login screen has one **Email or Username** and **Password** form, without a separate admin option. `POST /api/auth/login` accepts `identity` and `password`; legacy `email` payloads remain supported. The backend matches the configured admin username and verifies the original `ADMIN_USERNAME`/`ADMIN_PASSWORD`, without Supabase signup. Email identities continue through Supabase Auth. Unknown usernames and wrong credentials return the same generic 401; client role fields and user metadata cannot grant admin access. The legacy `/api/auth/admin/login` API remains secured for backwards compatibility but is not used or displayed by the UI.
+
+Admin sessions retain signed 15-minute JWTs and seven-day refresh sessions, with only keyed refresh-token hashes in `DATA_DIR/admin_sessions.sqlite3`. Refresh rotation, revocation and credential-change invalidation are unchanged. Successful login (or signup with an immediate session) always navigates to `index.html`, even when submitted from a workspace URL. Both roles see the same Homepage and **Dashboard** button: verified Admin sessions open `dashboard.html`, regular User sessions open `workspace.html`. Already authenticated page reloads resume that page. Backend checks continue to enforce permissions and private data ownership independently of UI navigation. Signup remains email-only with existing confirmation behavior.
 
 The local admin session store requires persistent storage shared by backend workers. On Vercel the current `DATA_DIR` is temporary and per-instance; use a persistent shared session store before relying on admin session persistence across serverless instances. Admin login credentials must also be configured in the deployment environment; editing the local `.env` does not update Vercel.
+
+## Admin dashboard and upload approval rollout
+
+Run `supabase/admin_panel.sql` after the existing auth/workspace migrations, then
+`supabase/upload_jobs.sql` for saved-upload storage/metadata if not applied yet.
+Run **`supabase/browser_processing.sql`** for browser-driven, owner-bound processing.
+No Cron, pg_net, Vault, scheduled worker or worker secret is required. These SQL
+changes are prepared locally, not run against production. See
+[UPLOAD_WORKFLOW.md](UPLOAD_WORKFLOW.md) for safe rollout and existing-job retention.
+
+The single Email or Username form and shared Homepage are unchanged. Its Dashboard
+button opens the verified role's Admin Dashboard or private User Workspace. Admin
+manages approval metadata; document APIs retain per-account ownership checks.
+
+Regular users save a PDF/image once. Admin approval permits processing when the
+User Dashboard is open; the browser resumes the existing page-by-page RAG workflow.
+Closing the page stops further requests; stored progress resumes on return without
+re-uploading. Pending/rejected/blocked files cannot be processed. One processing
+failure permits one retry, preserved across page reloads and restarts. Original
+Admin direct ingestion and Supabase user auth/refresh/logout are unchanged.
+
+Pending/rejected 30-day retention is now checked on Admin access, not scheduled.
+No database tables, records, private files or existing attempt counts are dropped
+by the transition migration. Frontend/backend must be deployed together. Existing
+OCR setup, Vercel request limits and serverless admin-session persistence remain
+independent limitations. No live deployment/provider checks have been performed.

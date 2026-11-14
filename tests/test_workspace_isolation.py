@@ -45,7 +45,9 @@ def as_user(user):
 class SupabaseMemory:
     """REST predicate/lease emulator, deliberately uses real application scopes."""
     def __init__(self):
-        self.tables = {'qa_domains': [], 'qa_documents': []}
+        self.tables = {'qa_domains': [], 'qa_documents': [], 'qa_upload_requests': [],
+                       'qa_upload_permissions': [{'user_id': ALICE['id'], 'policy': 'allowed'},
+                                                 {'user_id': BOB['id'], 'policy': 'allowed'}]}
         self.objects = {}
         self.calls = []
 
@@ -64,6 +66,14 @@ class SupabaseMemory:
                     self.objects.pop(key + '/' + suffix, None)
             return httpx.Response(200, json={})
         if '/rpc/' in path:
+            if path.endswith('qa_decide_saved_upload'):
+                found = next((r for r in self.tables['qa_upload_requests'] if r['id']==body['p_id'] and r['status']=='pending'),None)
+                if not found:
+                    return httpx.Response(200,json=[])
+                found.update(status=body['p_status'],reason=body['p_reason'],decided_at='2026-11-14T00:00:00+00:00')
+                if found.get('file_ready') and body['p_status']=='approved':
+                    found['job_state']='queued'
+                return httpx.Response(200,json=[copy.deepcopy(found)])
             found = next((row for row in self.tables['qa_documents']
                           if all(row.get(key) == body['p_' + arg]
                                  for key, arg in [('namespace', 'namespace'), ('domain', 'domain'), ('file_hash', 'hash')])), None)

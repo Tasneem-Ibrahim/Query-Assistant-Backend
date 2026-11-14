@@ -12,6 +12,23 @@ from rag import config, user_auth
 HEADERS = {"X-CSRF-Protection": "1"}
 
 class LocalAdminTests(unittest.TestCase):
+    def test_unified_login_uses_original_admin_credentials_without_supabase(self):
+        with patch.object(user_auth, 'provider', side_effect=AssertionError('Admin must not require Supabase')):
+            response = self.client.post('/api/auth/login', headers=HEADERS,
+                json={'identity': config.ADMIN_USERNAME, 'password': config.ADMIN_PASSWORD, 'role': 'user'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['user']['role'], 'admin')
+        self.assertEqual(self.client.get('/api/auth/session').json()['user']['id'], 'local-admin')
+
+    def test_unified_bad_admin_credentials_never_fall_back_to_supabase(self):
+        with patch.object(user_auth, 'provider', side_effect=AssertionError('No provider fallback')):
+            for identity in [config.ADMIN_USERNAME, 'unknown-user']:
+                response = self.client.post('/api/auth/login', headers=HEADERS,
+                    json={'identity': identity, 'password': 'incorrect'})
+                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.json()['detail'], 'Email or username, or password is incorrect.')
+                self.assertFalse(response.headers.get_list('set-cookie'))
+
     def setUp(self):
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)

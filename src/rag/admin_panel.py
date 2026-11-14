@@ -1,0 +1,186 @@
+"""Admin directory and approvals for private saved uploads.
+
+Service-role tables are never exposed directly to the browser; workspace
+identity always comes from authentication. Browser requests resume saved uploads.
+"""
+import hashlib
+from uuid import UUID
+
+from fastapi import APIRouter, HTTPException, Request, File, Form, UploadFile
+from pydantic import BaseModel, Field
+
+from . import cloud, config, workspace
+
+router = APIRouter(prefix="/api", tags=["Administration"])
+POLICIES = {"approval_required", "allowed", "blocked"}
+
+
+def admin(request):
+    if request.state.user.get("role") != "admin" or request.state.user.get("id") != "local-admin":
+        raise HTTPException(403, "Administrator access required.")
+
+
+def uid(value):
+    try:
+        return str(UUID(value))
+    except (ValueError, TypeError):
+        raise HTTPException(400, "Invalid user ID.") from None
+
+
+def policy(owner):
+    rows = cloud.rows("qa_upload_permissions", user_id="eq." + owner)
+    return rows[0]["policy"] if rows else "approval_required"
+
+
+def require_upload(key, filename, content):
+    if workspace.owner_id() == "admin":
+        return
+    owner = workspace.owner_id()
+    managed = cloud.rows('qa_upload_requests',user_id='eq.'+owner,domain='eq.'+key,
+        file_hash='eq.'+hashlib.sha256(content).hexdigest())
+    if any(r.get('file_ready') and r.get('job_state','none') != 'none' for r in managed):
+        raise HTTPException(409, 'This saved upload resumes from your Dashboard. Check its status below.')
+    mode = policy(owner)
+    if mode == "allowed":
+        return
+    if mode == "blocked":
+        raise HTTPException(403, "Uploads are blocked for your account. Contact the administrator.")
+    found = cloud.rows("qa_upload_requests", user_id="eq." + owner, domain="eq." + key,
+                       file_hash="eq." + hashlib.sha256(content).hexdigest(), status="eq.approved",
+                       filename="eq." + filename, size="eq." + str(len(content)))
+    if not found:
+        raise HTTPException(403, "Request admin approval for this file and knowledge base before uploading.")
+
+
+@router.get("/admin/users")
+def users(request: Request):
+    admin(request)
+    from . import saved_uploads
+    try:
+        saved_uploads.cleanup()
+    except cloud.CloudStorageError:
+        # Retention is best-effort on admin access, never a scheduler dependency.
+        pass
+    people = cloud.rows("users", select="id,name,email,created_at", order="created_at.desc,id.asc")
+    permissions = {r["user_id"]: r["policy"] for r in cloud.rows("qa_upload_permissions")}
+    from .saved_uploads import public_row
+    requests = [public_row(r) for r in cloud.rows("qa_upload_requests", order="created_at.desc,id.asc")]
+    for person in people:
+        person["policy"] = permissions.get(person["id"], "approval_required")
+        person["pending"] = sum(r["user_id"] == person["id"] and r["status"] == "pending" for r in requests)
+    return {"users": people, "requests": requests}
+
+
+class PermissionBody(BaseModel):
+    policy: str
+
+
+@router.put("/admin/users/{user_id}/permissions")
+def permissions(user_id: str, body: PermissionBody, request: Request):
+    admin(request)
+    user_id = uid(user_id)
+    if body.policy not in POLICIES:
+        raise HTTPException(400, "Invalid upload policy.")
+    if not cloud.rows("users", id="eq." + user_id):
+        raise HTTPException(404, "User not found.")
+    cloud.write("qa_upload_permissions", {"user_id": user_id, "policy": body.policy}, "user_id")
+    return {"policy": body.policy}
+
+
+@router.get("/upload-requests")
+def own_requests(request: Request):
+    from .saved_uploads import public_row
+    if workspace.owner_id() == "admin":
+        return {"policy": "allowed", "requests": []}
+    rows = cloud.rows('qa_upload_requests',user_id='eq.'+workspace.owner_id(),order='created_at.desc,id.asc')
+    return {'policy':policy(workspace.owner_id()),'requests':[public_row(r) for r in rows if not r.get('user_deleted_at')],
+            'ready_documents':[{'domain':r['domain'],'file_hash':r['file_hash'],'filename':r['filename']}
+                for r in rows if r['status']=='approved' and r.get('job_state')=='ready'],
+            'processing':[{'id':r['id'],'domain':r['domain'],'file_hash':r['file_hash'],'filename':r['filename']}
+                for r in rows if r['status']=='approved' and r.get('file_ready')
+                and r.get('job_state') not in {'ready','failed'}]}
+
+
+@router.delete('/upload-requests/{request_id}')
+def remove_own_card(request_id: str, request: Request):
+    from datetime import datetime, timezone
+    owner = workspace.owner_id()
+    if owner == 'admin':
+        raise HTTPException(403,'Only users can remove their own upload cards.')
+    request_id = uid(request_id)
+    rows = cloud.rows('qa_upload_requests',id='eq.'+request_id,user_id='eq.'+owner)
+    if not rows:
+        raise HTTPException(404,'Upload request not found.')
+    if not rows[0].get('user_deleted_at'):
+        cloud._request('PATCH','/rest/v1/qa_upload_requests',
+            params={'id':'eq.'+request_id,'user_id':'eq.'+owner,'user_deleted_at':'is.null'},
+            json={'user_deleted_at':datetime.now(timezone.utc).isoformat()})
+    return {'ok':True}
+
+
+@router.post('/uploads',status_code=201)
+async def saved_upload(request: Request, domain: str = Form(...), file: UploadFile = File(...),
+                       message: str = Form(default='',max_length=500), use_llm: bool = Form(default=True)):
+    from .domains import get_domain
+    from .saved_uploads import save
+    from starlette.concurrency import run_in_threadpool
+    try:
+        selected = get_domain(domain)
+    except ValueError:
+        raise HTTPException(404,'Knowledge base not found.') from None
+    content = await file.read(config.MAX_UPLOAD_BYTES+1)
+    return await run_in_threadpool(save,selected,file.filename or '',content,message,use_llm)
+
+
+class UploadRequest(BaseModel):
+    domain: str = Field(min_length=1, max_length=120)
+    filename: str = Field(min_length=1, max_length=255)
+    file_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size: int = Field(gt=0, le=config.MAX_UPLOAD_BYTES)
+    message: str = Field(default="", max_length=500)
+
+
+@router.post("/upload-requests")
+def create_request(body: UploadRequest, request: Request):
+    from .domains import get_domain
+    from .extract import SUPPORTED_EXTENSIONS
+    from pathlib import Path
+    if workspace.owner_id() == "admin":
+        raise HTTPException(400, "Admin uploads do not require approval.")
+    if policy(workspace.owner_id()) == "blocked":
+        raise HTTPException(403, "Uploads are blocked for your account.")
+    try:
+        domain = get_domain(body.domain)
+    except ValueError:
+        raise HTTPException(404, "Knowledge base not found.") from None
+    if Path(body.filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(400, "Unsupported file type.")
+    data = body.model_dump()
+    data.update(user_id=workspace.owner_id(), domain_label=domain.label)
+    # Ignore duplicates rather than resetting an approved/rejected decision.
+    result = cloud._request("POST", "/rest/v1/qa_upload_requests",
+        params={"on_conflict": "user_id,domain,file_hash"},
+        headers={"Prefer": "resolution=ignore-duplicates,return=representation"}, json=data).json()
+    if result:
+        return result[0]
+    return cloud.rows("qa_upload_requests", user_id="eq." + workspace.owner_id(),
+                      domain="eq." + body.domain, file_hash="eq." + body.file_hash)[0]
+
+
+class Decision(BaseModel):
+    status: str
+    reason: str = Field(default="", max_length=500)
+
+
+@router.put("/admin/upload-requests/{request_id}")
+def decide(request_id: str, body: Decision, request: Request):
+    admin(request)
+    request_id = uid(request_id)
+    if body.status not in {"approved", "rejected"}:
+        raise HTTPException(400, "Choose approved or rejected.")
+    changed = cloud._request('POST','/rest/v1/rpc/qa_decide_saved_upload',
+        json={'p_id':request_id,'p_status':body.status,'p_reason':body.reason.strip()}).json()
+    if not changed:
+        raise HTTPException(409, "This request was already decided or no longer exists. Refresh the list.")
+    from .saved_uploads import public_row
+    return public_row(changed[0])

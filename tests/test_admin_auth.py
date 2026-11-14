@@ -26,6 +26,15 @@ def token(age=0, lifetime=900):
 
 
 class UserAuthTests(unittest.TestCase):
+    def test_unified_email_login_role_is_not_client_controlled(self):
+        self.user['user_metadata'].update({'role': 'admin', '_local_admin': True})
+        response = self.client.post('/api/auth/login', headers=CSRF,
+            json={'identity': '  ' + USER['email'] + '  ', 'password': 'test-password', 'role': 'admin'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['user']['role'], 'user')
+        self.assertEqual(self.provider_calls[0][2]['json'], {'email': USER['email'], 'password': 'test-password'})
+        self.assertEqual(self.client.get('/api/admin/users').status_code, 403)
+
     def setUp(self):
         settings = patch.multiple(config, SUPABASE_URL='https://supabase.example', SUPABASE_ANON_KEY='public-key',
             AUTH_COOKIE_SECRET='test-secret', AUTH_COOKIE_SECURE=False, AUTH_COOKIE_SAMESITE='lax',

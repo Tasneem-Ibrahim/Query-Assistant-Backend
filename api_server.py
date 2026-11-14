@@ -33,10 +33,11 @@ from pydantic import BaseModel, Field  # noqa: E402
 from rag import answer, config, ingest, extract  # noqa: E402
 from rag.domains import create_domain, delete_domain, get_domain, list_domains, rename_domain  # noqa: E402
 from rag.cloud import CloudStorageError  # noqa: E402
-from rag import user_auth, workspace  # noqa: E402
+from rag import user_auth, workspace, admin_panel, saved_uploads  # noqa: E402
 
 app = FastAPI(title="Query Assistant API", version="1.0")
 app.include_router(user_auth.router)
+app.include_router(admin_panel.router)
 
 
 @app.exception_handler(CloudStorageError)
@@ -210,6 +211,16 @@ async def ingest_endpoint(
       {"type": "error", "message": "..."}
     """
     domain = _domain(key)
+
+    # Enforce approval before storage, extraction, embedding or processing.
+    if file is not None and file.filename:
+        approval_content = await file.read(config.MAX_UPLOAD_BYTES + 1)
+        if not approval_content or len(approval_content) > config.MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "Choose a non-empty PDF or image smaller than 4 MB.")
+        admin_panel.require_upload(key, file.filename, approval_content)
+        await file.seek(0)
+    elif workspace.owner_id() != "admin" and admin_panel.policy(workspace.owner_id()) == "blocked":
+        raise HTTPException(403, "Uploads are blocked for your account.")
 
     if config.CLOUD_MODE:
         from rag import cloud
@@ -385,13 +396,17 @@ def image_text(key: str, file_hash: str):
 
 @app.post("/api/domains/{key}/documents/{file_hash}/step")
 def process_page(key: str, file_hash: str):
-    if not config.CLOUD_MODE:
-        raise HTTPException(404, "Page jobs are only available in Supabase mode.")
     if not re.fullmatch(r"[a-f0-9]{64}", file_hash):
         raise HTTPException(400, "Invalid document identifier.")
+    saved = saved_uploads.find(key,file_hash)
+    if saved:
+        return saved_uploads.process_step(saved)
+    if not config.CLOUD_MODE:
+        raise HTTPException(404, "Page jobs are only available in Supabase mode.")
     from rag import cloud
+    domain = _domain(key)
     try:
-        return cloud.step(_domain(key), file_hash)
+        return cloud.step(domain, file_hash)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except RuntimeError as exc:

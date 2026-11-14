@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 
 import numpy as np
-from PIL import ImageFilter, ImageOps
+from PIL import Image, ImageFilter, ImageOps
 
 from . import config
 
@@ -99,10 +99,74 @@ def _read_line(image):
     return [word for words in _lines(data).values() for word in words]
 
 
-def refine_ocr(result):
-    """Refine at most four uncertain lines (eight additional bounded OCR calls).
+def _uncovered_footer(result):
+    """Recover visually present text below all recognized words, never guess it.
 
-    No line is dropped, merged or reordered. Unchanged confident words, digits,
+    A continuous decoration crossing the recognized-text boundary is excluded
+    from the crop. Two segmentation modes must agree at high word confidence.
+    """
+    lines = _lines(result.data)
+    words = [word for line in lines.values() for word in line]
+    if not words:
+        return ''
+    image = result.image.convert('L')
+    pixels = np.asarray(image)
+    height, width = pixels.shape
+    typical = max(8, int(np.median([word.height for word in words])))
+    bottom = max(word.top + word.height for word in words)
+    top = bottom + max(2, typical // 20)
+    if height - top < max(12, typical // 2):
+        return ''
+    background = int(np.bincount(pixels.ravel(), minlength=256).argmax())
+    ink = np.abs(pixels.astype('int16') - background) > 40
+    edge = max(2, min(width, height) // 150)
+    ink[:edge] = ink[-edge:] = False
+    ink[:, :edge] = ink[:, -edge:] = False
+    ys = np.flatnonzero(ink[top:].sum(axis=1) >= max(5, width // 200))
+    if not ys.size:
+        return ''
+    last = top + int(ys[-1]) + 1
+    # A thin vertical rule persists from above the old text into the missed area.
+    crossing = ink[max(edge, bottom - typical // 2):last].mean(axis=0) > .90
+    boundaries = np.flatnonzero(np.diff(np.r_[False, crossing, False]))
+    for left, right in zip(boundaries[::2], boundaries[1::2]):
+        if right - left < typical / 4 and last - top > typical:
+            ink[top:, left:right] = False
+    yy, xx = np.nonzero(ink[top:])
+    if len(xx) < max(40, width * typical // 25):
+        return ''
+    first, last = top + int(yy.min()), top + int(yy.max()) + 1
+    left, right = int(xx.min()), int(xx.max()) + 1
+    if last - first < typical / 3 or right - left < typical / 2:
+        return ''
+    padding = max(10, typical // 10)
+    crop = image.crop((max(0,left-padding), max(top,first-padding), min(width,right+padding), min(height,last+padding)))
+    crop = ImageOps.expand(crop,border=padding,fill=background)
+    import pytesseract
+    reads = []
+    try:
+        for mode in (6, 11):
+            data = pytesseract.image_to_data(crop,lang=config.OCR_LANG,config=f'--psm {mode}',
+                output_type=pytesseract.Output.DICT,timeout=20)
+            found = [word for line in _lines(data).values() for word in line]
+            if not found or min(word.confidence for word in found) < 85:
+                return ''
+            reads.append(' '.join(word.text for word in found))
+    except RuntimeError:
+        return ''
+    text = reads[0]
+    if text != reads[1] or sum(char.isalnum() for char in text) < 2:
+        return ''
+    if text.casefold() in ' '.join(result[0].split()).casefold():
+        return ''
+    return text
+
+
+def refine_ocr(result):
+    """Refine four uncertain lines and verify an uncovered footer when present.
+
+    Existing lines are never dropped, merged or reordered; a confirmed footer
+    can be appended using at most two extra calls. Confident words, digits,
     punctuation and failed/disagreeing retries are retained verbatim.
     """
     if not hasattr(result, 'data'):
@@ -149,4 +213,10 @@ def refine_ocr(result):
         if key in bullets:
             texts[0] = '•'
         output.append(' '.join(texts))
+    try:
+        footer = _uncovered_footer(result)
+    except (ValueError, RuntimeError):
+        footer = ''
+    if footer:
+        output.append(footer)
     return '\n'.join(output)

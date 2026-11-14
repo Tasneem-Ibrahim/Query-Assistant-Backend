@@ -37,6 +37,10 @@ class AdaptiveOCRTests(unittest.TestCase):
         self.assertFalse(extract._prefer_ocr(partial, full))
         self.assertTrue(extract._prefer_ocr(('Corrected full policy', 96, 96, 168), full))
 
+    def test_long_background_garbage_does_not_block_readable_text(self):
+        self.assertTrue(extract._prefer_ocr(('Readable short quote', 93, 80, 18),
+                                           ('scenery symbols' * 20, 30, 8, 280)))
+
     @unittest.skipUnless(config.tesseract_cmd(), 'Tesseract is not installed')
     def test_hospital_notice_keeps_last_line(self):
         path = Path(__file__).resolve().parents[2] / 'documents' / 'Hospital Visiting Policy Notice.png'
@@ -78,12 +82,40 @@ class AdaptiveOCRTests(unittest.TestCase):
             path = root / 'test.png'
             self.image.save(path)
             digest = extract.file_sha256(path)
-            (root / f'{digest}.ocr-v2.raw.json').write_text('[]')
+            (root / f'{digest}.ocr-v6.raw.json').write_text('[]')
             with patch.multiple(config, DATA_DIR=root, CACHE_DIR=root), patch.object(extract, 'ocr_image', return_value='New extraction') as read:
                 self.assertEqual(extract.extract_pdf(path)[0]['image_text'], ['New extraction'])
                 extract.extract_pdf(path)
                 read.assert_called_once()
-            self.assertTrue((root / f'{digest}.ocr-v5.raw.json').exists())
+            self.assertTrue((root / f'{digest}.ocr-v7.raw.json').exists())
+
+    @unittest.skipUnless(config.tesseract_cmd(), 'Tesseract is not installed')
+    def test_light_quote_on_scenery_in_image_and_cloud_pdf_paths(self):
+        path = Path(__file__).resolve().parents[2] / 'documents' / 'images (7).jfif'
+        if not path.exists():
+            self.skipTest('User scenic quote fixture is unavailable')
+        import pymupdf
+        from rag import cloud
+        expected = 'YOUR ONLY LIMIT IS YOU'
+        with Image.open(path) as image:
+            self.assertEqual(' '.join(extract.ocr_image(image, psm=3).split()), expected)
+        with patch.dict('os.environ', {'OCR_PROVIDER': 'tesseract'}):
+            with pymupdf.open(stream=extract.document_pdf(path.name, path.read_bytes()), filetype='pdf') as pdf:
+                self.assertEqual(' '.join(cloud._ocr_page(pdf, 0).split()), expected)
+
+    @unittest.skipUnless(config.tesseract_cmd(), 'Tesseract is not installed')
+    def test_large_quote_footer_is_recovered_in_image_and_cloud_pdf_paths(self):
+        path = Path(__file__).resolve().parents[2] / 'documents' / 'images (14).jfif'
+        if not path.exists():
+            self.skipTest('User quote image fixture is unavailable')
+        import pymupdf
+        from rag import cloud
+        expected = 'A NEGATIVE MIND WILL NEVER GIVE YOU A POSITIVE LIFE'
+        with Image.open(path) as image:
+            self.assertEqual(' '.join(extract.ocr_image(image,psm=3).split()),expected)
+        with patch.dict('os.environ',{'OCR_PROVIDER':'tesseract'}):
+            with pymupdf.open(stream=extract.document_pdf(path.name,path.read_bytes()),filetype='pdf') as pdf:
+                self.assertEqual(' '.join(cloud._ocr_page(pdf,0).split()),expected)
 
     def test_alpha_and_working_size_bound(self):
         result = extract._prepare_for_ocr(Image.new('RGBA', (20, 20000), (0, 0, 0, 0)))
