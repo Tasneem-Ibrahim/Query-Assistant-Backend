@@ -3,7 +3,9 @@
 Service-role tables are never exposed directly to the browser; workspace
 identity always comes from authentication. Browser requests resume saved uploads.
 """
+from collections import Counter, defaultdict
 import hashlib
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request, File, Form, UploadFile
@@ -69,6 +71,65 @@ def users(request: Request):
         person["policy"] = permissions.get(person["id"], "approval_required")
         person["pending"] = sum(r["user_id"] == person["id"] and r["status"] == "pending" for r in requests)
     return {"users": people, "requests": requests}
+
+
+@router.get("/admin/users/{owner}/activity")
+def user_activity(request: Request, owner: str):
+    admin(request)
+    owner = uid(owner)
+    from . import domains, ingest
+    from .extract import IMAGE_EXTENSIONS
+
+    uploads = cloud.rows(
+        "qa_upload_requests", user_id="eq." + owner,
+        select="domain,file_hash,filename,status,file_ready,job_state", order="id.asc",
+    )
+    uploads_by_domain = defaultdict(list)
+    for upload in uploads:
+        uploads_by_domain[upload["domain"]].append(upload)
+    token = workspace.bind({"id": owner})
+    try:
+        documents_by_domain = defaultdict(dict)
+        if config.CLOUD_MODE:
+            for row in cloud.rows(
+                "qa_documents", namespace="eq." + config.embedding_namespace(),
+                select="domain,file_hash,name,status", order="domain.asc,file_hash.asc",
+            ):
+                documents_by_domain[row["domain"]][row["file_hash"]] = (row["name"], row["status"])
+        bases = []
+        for domain in domains.list_domains():
+            if config.CLOUD_MODE:
+                files = documents_by_domain[domain.key]
+            else:
+                files = {
+                    digest: (row["name"], "ready")
+                    for digest, row in ingest.list_ingested(domain.key).items()
+                }
+            approvals = Counter()
+            for upload in uploads_by_domain[domain.key]:
+                approvals[upload["status"]] += 1
+                digest = upload["file_hash"]
+                job = upload.get("job_state")
+                current = files.get(digest)
+                if upload["status"] not in {"pending", "approved"} or not upload.get("file_ready"):
+                    continue
+                if current and current[1] == "ready":
+                    continue
+                if job in {"queued", "processing", "retrying", "failed"}:
+                    files[digest] = (upload["filename"], job)
+                elif not current and job != "ready":
+                    files[digest] = (upload["filename"], "saved")
+            types = Counter(Path(name).suffix.lower() for name, _ in files.values())
+            bases.append({
+                "name": domain.label,
+                "pdfs": types[".pdf"],
+                "images": sum(types[extension] for extension in IMAGE_EXTENSIONS),
+                "approvals": dict(approvals),
+                "processing": dict(Counter(status for _, status in files.values() if status != "saved")),
+            })
+    finally:
+        workspace.reset(token)
+    return {"knowledge_bases": bases}
 
 
 class PermissionBody(BaseModel):

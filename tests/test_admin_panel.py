@@ -60,6 +60,44 @@ class ApprovalTests(unittest.TestCase):
         response = self.req('alice', 'POST', '/upload-requests', json={k: self.row[k] for k in ['domain', 'filename', 'file_hash', 'size']})
         self.assertEqual(response.status_code, 403)
 
+    def test_user_activity_returns_only_selected_workspace_counts_to_admin(self):
+        self.prepare()
+        self.storage.tables['qa_upload_requests'][0]['status'] = 'approved'
+        self.upload('alice', self.key)
+        self.storage.tables['qa_upload_requests'] = [
+            dict(self.row, status='approved'),
+            dict(self.row, filename='scan.png', file_hash='a' * 64, file_ready=True),
+            dict(self.row, user_id=BOB['id'], filename='private.jpg', file_hash='b' * 64, file_ready=True),
+        ]
+        url = '/admin/users/' + ALICE['id'] + '/activity'
+        self.assertEqual(self.req('alice', 'GET', url).status_code, 403)
+        self.assertEqual(self.req('bob', 'GET', url).status_code, 403)
+        result = self.req('admin', 'GET', url)
+        self.assertEqual(result.json(), {'knowledge_bases': [{
+            'name': 'Private', 'pdfs': 1, 'images': 1,
+            'approvals': {'approved': 1, 'pending': 1}, 'processing': {'ready': 1},
+        }]})
+
+    def test_cloud_activity_counts_the_selected_namespace(self):
+        self.prepare()
+        tables = self.storage.tables
+        tables['qa_domains'] = [
+            {'owner_id': ALICE['id'], 'key': self.key, 'label': 'Private'},
+            {'owner_id': BOB['id'], 'key': self.key, 'label': 'Other'},
+        ]
+        for person, filename in [(ALICE, 'report.pdf'), (BOB, 'scan.png')]:
+            with isolation.as_user(person):
+                tables['qa_documents'].append({
+                    'namespace': admin_panel.config.embedding_namespace(), 'domain': self.key,
+                    'file_hash': 'a' * 64, 'name': filename, 'status': 'ready',
+                })
+        with patch.object(admin_panel.config, 'CLOUD_MODE', True):
+            response = self.req('admin', 'GET', '/admin/users/' + ALICE['id'] + '/activity')
+        self.assertEqual(response.json(), {'knowledge_bases': [{
+            'name': 'Private', 'pdfs': 1, 'images': 0,
+            'approvals': {'pending': 1}, 'processing': {'ready': 1},
+        }]})
+
     def test_rejection_reason_optional_and_decisions_cannot_be_overwritten(self):
         self.prepare()
         path = '/admin/upload-requests/' + self.row['id']
