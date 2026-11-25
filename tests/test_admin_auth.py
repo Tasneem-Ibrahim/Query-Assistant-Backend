@@ -3,6 +3,7 @@ import base64
 import copy
 import json
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -13,7 +14,8 @@ from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import api_server
-from rag import config, user_auth
+from rag import access_control, config, security_store, user_auth
+from auth_helpers import complete_mfa
 
 USER = {"id": "50c0eb32-2055-42ca-98d4-1dbe793f1ef8", "email": "person@example.com", "user_metadata": {"name": "Test Person"}}
 CSRF = {"X-CSRF-Protection": "1", "Origin": "http://localhost:3000"}
@@ -30,15 +32,18 @@ class UserAuthTests(unittest.TestCase):
         self.user['user_metadata'].update({'role': 'admin', '_local_admin': True})
         response = self.client.post('/api/auth/login', headers=CSRF,
             json={'identity': '  ' + USER['email'] + '  ', 'password': 'test-password', 'role': 'admin'})
+        response = complete_mfa(self.client, response, self.user['id'], CSRF)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()['user']['role'], 'user')
         self.assertEqual(self.provider_calls[0][2]['json'], {'email': USER['email'], 'password': 'test-password'})
         self.assertEqual(self.client.get('/api/admin/users').status_code, 403)
 
     def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
         settings = patch.multiple(config, SUPABASE_URL='https://supabase.example', SUPABASE_ANON_KEY='public-key',
             AUTH_COOKIE_SECRET='test-secret', AUTH_COOKIE_SECURE=False, AUTH_COOKIE_SAMESITE='lax',
-            CORS_ORIGINS=['http://localhost:3000'])
+            CORS_ORIGINS=['http://localhost:3000'], DATA_DIR=Path(folder.name), CLOUD_MODE=False)
         settings.start()
         self.addCleanup(settings.stop)
         self.provider_calls = []
@@ -72,12 +77,16 @@ class UserAuthTests(unittest.TestCase):
         self.addCleanup(self.client.close)
 
     def login(self):
-        return self.client.post('/api/auth/login', headers=CSRF, json={'email': USER['email'], 'password': 'test-password'})
+        response = self.client.post('/api/auth/login', headers=CSRF, json={'email': USER['email'], 'password': 'test-password'})
+        return complete_mfa(self.client, response, self.user['id'], CSRF)
 
     def test_signup_login_and_profile_session(self):
         response = self.client.post('/api/auth/signup', headers=CSRF,
             json={'name': 'Test Person', 'email': USER['email'], 'password': 'test-password'})
         self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['mfa_required'], 'setup')
+        self.assertEqual(self.client.get('/api/auth/session').status_code, 401)
+        response = complete_mfa(self.client, response, self.user['id'], CSRF)
         self.assertEqual(response.json()['user']['name'], 'Test Person')
         self.assertNotIn('access_token', response.text)
         self.assertNotIn('refresh_token', response.text)
@@ -93,8 +102,9 @@ class UserAuthTests(unittest.TestCase):
             self.assertIn('HttpOnly', cookie)
             self.assertIn('SameSite=lax', cookie)
             self.assertIn('Path=/api', cookie)
-        self.assertIn('Max-Age=900', response.headers.get_list('set-cookie')[0])
-        self.assertIn('Max-Age=604800', response.headers.get_list('set-cookie')[1])
+        cookies = {cookie.split('=', 1)[0]: cookie for cookie in response.headers.get_list('set-cookie')}
+        self.assertIn('Max-Age=900', cookies[user_auth.ACCESS])
+        self.assertIn('Max-Age=604800', cookies[user_auth.REFRESH])
         with patch.object(config, 'AUTH_COOKIE_SECURE', True):
             secure = self.login()
             self.assertTrue(all('Secure' in c for c in secure.headers.get_list('set-cookie')))
@@ -140,6 +150,23 @@ class UserAuthTests(unittest.TestCase):
         self.login()
         self.client.cookies.set(user_auth.ACCESS, token(age=901, lifetime=3600), domain='testserver.local', path='/api')
         self.assertEqual(self.client.get('/api/auth/session').status_code, 401)
+
+    def test_verified_session_is_bound_to_account(self):
+        self.login()
+        self.user['id'] = '55555555-5555-4555-8555-555555555555'
+        self.assertEqual(self.client.get('/api/auth/session').status_code, 401)
+        self.assertEqual(self.client.post('/api/auth/refresh', headers=CSRF).status_code, 401)
+
+    def test_role_module_disable_applies_to_active_session_and_account_overrides(self):
+        self.user['app_metadata'] = {'qa_access': {'permissions': {'bases.view': True}}}
+        self.login()
+        self.assertTrue(self.client.get('/api/auth/session').json()['user']['permissions']['bases.view'])
+        self.assertTrue(security_store.write('policy:user', {'modules': {'bases': False}}, 0))
+        self.assertEqual(self.client.get('/api/domains').status_code, 403)
+        self.assertFalse(self.client.get('/api/auth/session').json()['user']['permissions']['bases.view'])
+        _, revision = access_control.policy('user')
+        self.assertTrue(security_store.write('policy:user', {'modules': {'bases': True}}, revision))
+        self.assertNotEqual(self.client.get('/api/domains').status_code, 403)
 
     def test_session_expiry_and_tampering_rejected(self):
         for value in ['9999999999.forged', user_auth.sign_deadline(int(time.time()) - 1, 'refresh-1')]:

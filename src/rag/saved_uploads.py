@@ -41,15 +41,25 @@ def page_count(filename, content):
         raise HTTPException(400,'Choose a readable, unlocked PDF with 1-500 pages.') from None
 
 
-def save(domain, filename, content, message='', use_llm=True):
-    from .admin_panel import policy
+def queue_saved_upload(request_id, object_path, mode):
+    return cloud._request('PATCH','/rest/v1/qa_upload_requests',
+        params={'id':'eq.'+request_id,'status':'in.(pending,approved)' if mode == 'allowed' else 'eq.approved',
+                'job_state':'eq.none','file_ready':'eq.true'},
+        headers={'Prefer':'return=representation'},json={'status':'approved','object_path':object_path,
+            'job_state':'queued','job_message':'Your file is saved. Processing starts when your Dashboard is open.'}).json()
+
+
+def save(domain, filename, content, message='', use_llm=True, *, request_approval=False, direct_upload=False):
+    from .admin_panel import upload_mode
     from .extract import SUPPORTED_EXTENSIONS
     owner = workspace.owner_id()
     if owner == 'admin':
         raise HTTPException(400, 'Admin can use the existing direct upload.')
-    mode = policy(owner)
+    mode = upload_mode(owner, direct_upload)
     if mode == 'blocked':
         raise HTTPException(403, 'Uploads are blocked for your account.')
+    if request_approval:
+        mode = 'approval_required'
     if not content or len(content) > config.MAX_UPLOAD_BYTES:
         raise HTTPException(413, 'Choose a non-empty file smaller than 4 MB.')
     if Path(filename).suffix.lower() not in SUPPORTED_EXTENSIONS:
@@ -65,6 +75,11 @@ def save(domain, filename, content, message='', use_llm=True):
     cloud._request('POST','/rest/v1/qa_upload_requests',params={'on_conflict':'user_id,domain,file_hash'},
         headers={'Prefer':'resolution=ignore-duplicates'},json=row)
     existing = cloud.rows('qa_upload_requests',user_id='eq.'+owner,domain='eq.'+domain.key,file_hash='eq.'+digest)[0]
+    if existing.get('admin_deleted_at'):
+        raise HTTPException(409, 'An approval request for this file was removed.')
+    if existing.get('file_ready') and mode == 'allowed' and direct_upload and existing['status'] == 'pending':
+        queued = queue_saved_upload(existing['id'], existing['object_path'], mode)
+        return public_row((queued or cloud.rows('qa_upload_requests', id='eq.'+existing['id']))[0])
     if existing.get('file_ready') or existing['status'] in {'rejected','expired'}:
         return public_row(existing)
     if existing.get('object_path') != path:
@@ -77,10 +92,7 @@ def save(domain, filename, content, message='', use_llm=True):
     result = cloud._request('PATCH','/rest/v1/qa_upload_requests',
         params={'id':'eq.'+existing['id'],'status':'in.(pending,approved)'},headers={'Prefer':'return=representation'},
         json={'file_ready':True,'object_path':path,'pages':pages,'job_message':'Your file is saved and awaiting admin approval.'}).json()
-    queued = cloud._request('PATCH','/rest/v1/qa_upload_requests',
-            params={'id':'eq.'+existing['id'],'status':'in.(pending,approved)' if mode == 'allowed' else 'eq.approved','job_state':'eq.none'},
-            headers={'Prefer':'return=representation'},json={'status':'approved','file_ready':True,'object_path':path,
-                'job_state':'queued','job_message':'Your file is saved. Processing starts when your Dashboard is open.'}).json()
+    queued = queue_saved_upload(existing['id'], path, mode)
     if queued:
         result = queued
     if not result:
@@ -111,7 +123,7 @@ def find(key, digest):
     if workspace.owner_id() == 'admin':
         return None
     rows = cloud.rows('qa_upload_requests',user_id='eq.'+workspace.owner_id(),domain='eq.'+key,file_hash='eq.'+digest)
-    return rows[0] if rows and rows[0].get('file_ready') else None
+    return rows[0] if rows and (rows[0].get('file_ready') or rows[0].get('admin_deleted_at')) else None
 
 
 def process_step(row):

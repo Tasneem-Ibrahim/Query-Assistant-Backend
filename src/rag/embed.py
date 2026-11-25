@@ -21,15 +21,32 @@ class APIEmbedder:
     def _encode(self, texts):
         import httpx
 
-        batches = []
-        for start in range(0, len(texts), 16):
-            response = httpx.post(config.EMBEDDING_API_URL,
+        def request(model, batch):
+            return httpx.post(
+                config.EMBEDDING_API_URL,
                 headers={"Authorization": f"Bearer {config.EMBEDDING_API_KEY}"},
-                json={"model": self.model_name, "input": texts[start:start + 16]}, timeout=60)
+                json={"model": model, "input": batch},
+                timeout=60,
+            )
+
+        batches = []
+        model = self.model_name
+        fallback = config.EMBEDDING_API_FALLBACK_MODEL
+        for start in range(0, len(texts), 16):
+            batch = texts[start:start + 16]
+            response = request(model, batch)
+            if response.status_code == 410 and fallback and model != fallback:
+                model = fallback
+                response = request(model, batch)
+            if response.status_code == 410:
+                raise RuntimeError(
+                    "The embedding provider reported that the configured model route is gone (HTTP 410). "
+                    "Ask your administrator to check the embedding provider before retrying."
+                )
             if not response.is_success:
                 raise RuntimeError(f"Embedding provider returned HTTP {response.status_code}. Check its configuration and quota.")
             data = sorted(response.json()["data"], key=lambda item: item["index"])
-            if [item["index"] for item in data] != list(range(len(texts[start:start + 16]))):
+            if [item["index"] for item in data] != list(range(len(batch))):
                 raise ValueError("Embedding provider returned missing or duplicate vectors.")
             vectors = np.asarray([item["embedding"] for item in data], dtype="float32")
             if vectors.shape != (len(data), self.dim) or not np.isfinite(vectors).all():

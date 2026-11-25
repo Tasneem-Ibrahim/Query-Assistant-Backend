@@ -45,7 +45,7 @@ def as_user(user):
 class SupabaseMemory:
     """REST predicate/lease emulator, deliberately uses real application scopes."""
     def __init__(self):
-        self.tables = {'qa_domains': [], 'qa_documents': [], 'qa_upload_requests': [],
+        self.tables = {'qa_domains': [], 'qa_documents': [], 'qa_upload_requests': [], 'qa_activity_events': [],
                        'qa_upload_permissions': [{'user_id': ALICE['id'], 'policy': 'allowed'},
                                                  {'user_id': BOB['id'], 'policy': 'allowed'}]}
         self.objects = {}
@@ -105,6 +105,9 @@ class SupabaseMemory:
             offset = params.get('offset', 0)
             return httpx.Response(200, json=copy.deepcopy([r for r in rows if matches(r)][offset:offset + params.get('limit', 1000)]))
         if method == 'POST':
+            if table == 'qa_activity_events':
+                rows.append(dict(body, id=len(rows) + 1))
+                return httpx.Response(201)
             conflict = params['on_conflict'].split(',')
             found = next((r for r in rows if all(r.get(k) == body[k] for k in conflict)), None)
             if found:

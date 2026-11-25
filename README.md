@@ -224,6 +224,7 @@ Use **`api_server:app`** for the browser frontend. `api.py` is a compatibility e
 | `EMBEDDING_PROVIDER` | `api` in Supabase mode; otherwise `local` | Embedding implementation |
 | `EMBEDDING_API_URL` | Empty | Full compatible `/embeddings` endpoint |
 | `EMBEDDING_API_MODEL` | Empty | Exact provider model identifier |
+| `EMBEDDING_API_FALLBACK_MODEL` | Empty | Optional same-provider model tried once on HTTP 410. Use only a model documented to share the primary text embedding space and output dimension. The primary model still identifies the existing index namespace. |
 | `EMBEDDING_DIMENSIONS` | `0` | Required actual API output dimension |
 | `EMBEDDING_MODEL` | `intfloat/multilingual-e5-small` | Alternative local embedding model |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | LLM base URL |

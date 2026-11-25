@@ -165,6 +165,18 @@ class SavedUploadTests(unittest.TestCase):
         self.storage.tables['qa_upload_permissions'][0]['policy']='allowed'
         row=self.save().json();self.assertEqual(row['job_state'],'queued');self.assertEqual(row['status'],'approved')
 
+    def test_user_role_direct_upload_queues_and_preserves_explicit_block(self):
+        pending = self.save().json()
+        self.assertEqual(pending['status'], 'pending')
+        with patch.dict(isolation.ALICE, {'permissions': {'user_uploads.add': True}}):
+            self.assertEqual(self.req('alice', 'GET', '/upload-requests').json()['policy'], 'allowed')
+            queued = self.save().json()
+            self.assertEqual((queued['id'], queued['status'], queued['job_state']), (pending['id'], 'approved', 'queued'))
+            self.storage.tables['qa_upload_permissions'] = [{'user_id': isolation.ALICE['id'], 'policy': 'blocked'}]
+            self.assertEqual(self.save().status_code, 403)
+        self.storage.tables['qa_upload_permissions'] = []
+        self.assertEqual(self.req('alice', 'GET', '/upload-requests').json()['policy'], 'approval_required')
+
     def test_manual_reprocessing_cannot_bypass_automatic_retry_limit(self):
         row=self.save().json();self.approve(row)
         entry=self.storage.tables['qa_upload_requests'][0];entry.update(job_state='failed',attempts=2)

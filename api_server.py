@@ -25,19 +25,63 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile  # noqa: E402
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import JSONResponse, StreamingResponse, Response  # noqa: E402
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field  # noqa: E402
 
 from rag import answer, config, ingest, extract  # noqa: E402
 from rag.domains import create_domain, delete_domain, get_domain, list_domains, rename_domain  # noqa: E402
 from rag.cloud import CloudStorageError  # noqa: E402
-from rag import user_auth, workspace, admin_panel, saved_uploads  # noqa: E402
+from rag import user_auth, workspace, admin_panel, saved_uploads, access_control, super_admin, security_store  # noqa: E402
 
 app = FastAPI(title="Query Assistant API", version="1.0")
 app.include_router(user_auth.router)
 app.include_router(admin_panel.router)
+app.include_router(super_admin.router)
+
+ACTIVITY_ROUTES = {
+    ("POST", "/api/super-admin/accounts"): ("user-details", "Created or invited account"),
+    ("DELETE", "/api/super-admin/accounts/{owner}"): ("user-details", "Permanently deleted account"),
+    ("PUT", "/api/super-admin/original-admin/status"): ("user-details", "Updated original Admin access status"),
+    ("PUT", "/api/admin/users/{user_id}/permissions"): ("user-details", "Updated account upload policy"),
+    ("PUT", "/api/super-admin/permission-settings/{role}"): ("role-management", "Updated role permissions"),
+    ("PUT", "/api/super-admin/original-admin/permissions"): ("role-management", "Updated original Admin permissions"),
+    ("PUT", "/api/super-admin/accounts/{owner}/upload-approval"): ("role-management", "Updated upload approval access"),
+    ("PUT", "/api/super-admin/roles/admin"): ("role-management", "Updated Admin role status"),
+    ("POST", "/api/domains"): ("knowledge-base", "Created knowledge base"),
+    ("PATCH", "/api/domains/{key}"): ("knowledge-base", "Renamed knowledge base"),
+    ("DELETE", "/api/domains/{key}"): ("knowledge-base", "Deleted knowledge base"),
+    ("POST", "/api/domains/{key}/reset"): ("knowledge-base", "Reset knowledge base"),
+    ("POST", "/api/domains/{key}/ingest"): ("knowledge-base", "Started document upload or processing"),
+    ("PUT", "/api/domains/{key}/documents/{file_hash}/chunks"): ("knowledge-base", "Edited document text"),
+    ("DELETE", "/api/domains/{key}/documents/{file_hash}"): ("knowledge-base", "Deleted document"),
+    ("POST", "/api/uploads"): ("knowledge-base", "Submitted file for upload"),
+    ("POST", "/api/upload-requests"): ("knowledge-base", "Submitted upload request"),
+    ("PUT", "/api/admin/upload-requests/{request_id}"): ("knowledge-base", "Reviewed upload request"),
+    ("DELETE", "/api/admin/upload-requests/{request_id}"): ("knowledge-base", "Removed upload request"),
+    ("POST", "/api/admin/upload-requests/for/{owner}"): ("knowledge-base", "Submitted file for another account"),
+}
+
+
+def log_request_activity(request, owner):
+    route = getattr(request.scope.get("route"), "path", None)
+    event = ACTIVITY_ROUTES.get((request.method, route))
+    events = getattr(request.state, "activity_events", None) or ([event] if event else [])
+    if not events:
+        return
+    params = request.path_params
+    target = getattr(request.state, "activity_target", None) or next(iter(params.values()), None)
+    if events[0][0] == "knowledge-base" and "owner" not in params and "request_id" not in params:
+        parts = (owner, target, params.get("file_hash"))
+        target = " / ".join(part for part in parts if part)
+    if not target and "original-admin" in route:
+        target = "local-admin"
+    if not target and route.endswith("/roles/admin"):
+        target = "admin"
+    for category, action in events:
+        security_store.record_activity(category, request.state.user["id"], target, action)
 
 
 @app.exception_handler(CloudStorageError)
@@ -47,7 +91,8 @@ async def storage_error_handler(request, exc):
 
 @app.middleware("http")
 async def require_user(request, call_next):
-    owner_token = None
+    owner_token = actor_token = None
+    writer = None
     # Protect every RAG route, including future routes and API documentation.
     if request.method != "OPTIONS":
         try:
@@ -57,16 +102,36 @@ async def require_user(request, call_next):
             if request.url.path not in user_auth.PUBLIC_PATHS:
                 await user_auth.authenticate(request)
                 try:
-                    owner_token = workspace.bind(request.state.user)
+                    access_control.authorize(request.state.user, request.url.path, request.method)
+                    identity = (await run_in_threadpool(super_admin.selected_workspace, request)
+                                if request.headers.get("x-workspace-account") else request.state.user)
+                    owner_token = workspace.bind(identity)
+                    path = request.url.path
+                    if (request.method in {"DELETE", "PATCH", "POST", "PUT"}
+                            and path.startswith(("/api/domains", "/api/uploads", "/api/upload-requests"))):
+                        owner = identity["id"]
+                        if not workspace.begin_write(owner):
+                            workspace.reset(owner_token)
+                            raise HTTPException(409, "This workspace is being deleted.")
+                        writer = owner
+                    actor_token = workspace.bind_actor(request.state.user)
                 except (ValueError, KeyError, TypeError):
                     raise HTTPException(401, "Invalid account identity. Please sign in again.") from None
+        except CloudStorageError as exc:
+            return await storage_error_handler(request, exc)
         except HTTPException as exc:
             return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers={"Cache-Control": "no-store"})
     try:
         response = await call_next(request)
     finally:
+        if writer is not None:
+            workspace.end_write(writer)
+        if actor_token is not None:
+            workspace.reset_actor(actor_token)
         if owner_token is not None:
             workspace.reset(owner_token)
+    if actor_token is not None and request.method in {"POST", "PUT", "PATCH", "DELETE"} and 200 <= response.status_code < 300:
+        await run_in_threadpool(log_request_activity, request, identity["id"])
     response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -123,9 +188,11 @@ def domains():
 
 
 @app.post("/api/domains", status_code=201)
-def new_domain(body: DomainBody):
+def new_domain(body: DomainBody, request: Request):
     try:
-        return domain_info(create_domain(body.name))
+        domain = create_domain(body.name)
+        request.state.activity_target = domain.key
+        return domain_info(domain)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -199,6 +266,7 @@ def reset(key: str):
 @app.post("/api/domains/{key}/ingest")
 async def ingest_endpoint(
     key: str,
+    request: Request,
     file: UploadFile | None = File(default=None),
     force: bool = Form(default=False),
     use_llm: bool = Form(default=True),
@@ -212,14 +280,22 @@ async def ingest_endpoint(
     """
     domain = _domain(key)
 
+    delegated_upload = request.state.user["role"] == "admin" and request.headers.get("x-workspace-account")
+    if delegated_upload and (force or file is None or not file.filename):
+        raise HTTPException(400, "Select a PDF or image to add to this user workspace.")
+
+    if force and not access_control.allows(request.state.user, "documents.edit"):
+        raise HTTPException(403, "Editing documents is disabled for your account.")
+
     # Enforce approval before storage, extraction, embedding or processing.
     if file is not None and file.filename:
         approval_content = await file.read(config.MAX_UPLOAD_BYTES + 1)
         if not approval_content or len(approval_content) > config.MAX_UPLOAD_BYTES:
             raise HTTPException(413, "Choose a non-empty PDF or image smaller than 4 MB.")
-        admin_panel.require_upload(key, file.filename, approval_content)
+        admin_panel.require_upload(key, file.filename, approval_content,
+                                   direct_upload=access_control.allows_direct_upload(request.state.user))
         await file.seek(0)
-    elif workspace.owner_id() != "admin" and admin_panel.policy(workspace.owner_id()) == "blocked":
+    elif not workspace.privileged_actor() and workspace.owner_id() != "admin" and admin_panel.policy(workspace.owner_id()) == "blocked":
         raise HTTPException(403, "Uploads are blocked for your account.")
 
     if config.CLOUD_MODE:
@@ -257,7 +333,14 @@ async def ingest_endpoint(
             extract.document_pdf(safe, content)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
-        target.write_bytes(content)
+        if delegated_upload:
+            try:
+                with target.open("xb") as stream:
+                    stream.write(content)
+            except FileExistsError:
+                raise HTTPException(409, "A file with this name already exists in the user workspace.") from None
+        else:
+            target.write_bytes(content)
         targets = [target]
     else:
         targets = domain.default_pdfs()
@@ -265,6 +348,9 @@ async def ingest_endpoint(
             raise HTTPException(404, f"No bundled PDF found in pdfs/{domain.pdf_subdir}/. Upload one instead.")
 
     events: "queue.Queue[dict | None]" = queue.Queue()
+    writer = "local-admin" if workspace.owner_id() == "admin" else workspace.owner_id()
+    if not workspace.begin_write(writer):
+        raise HTTPException(409, "This workspace is being deleted.")
 
     def work() -> None:
         try:
@@ -277,10 +363,15 @@ async def ingest_endpoint(
         except Exception as exc:
             events.put({"type": "error", "message": str(exc)})
         finally:
+            workspace.end_write(writer)
             events.put(None)
 
     context = copy_context()
-    threading.Thread(target=context.run, args=(work,), daemon=True).start()
+    try:
+        threading.Thread(target=context.run, args=(work,), daemon=True).start()
+    except Exception:
+        workspace.end_write(writer)
+        raise
 
     def stream():
         while True:

@@ -14,6 +14,8 @@ BASE_DIR = Path(__file__).resolve().parents[2]
 load_dotenv(BASE_DIR / ".env")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "Admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+SUPER_ADMIN_USERNAME = os.getenv("SUPER_ADMIN_USERNAME", "Super Admin")
+SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "")
 CLOUD_MODE = os.getenv("STORAGE_BACKEND", "supabase" if os.getenv("VERCEL") else "local") == "supabase"
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
@@ -29,6 +31,7 @@ EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "api" if CLOUD_MODE else "l
 EMBEDDING_API_URL = os.getenv("EMBEDDING_API_URL", "")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", "")
 EMBEDDING_API_MODEL = os.getenv("EMBEDDING_API_MODEL", "")
+EMBEDDING_API_FALLBACK_MODEL = os.getenv("EMBEDDING_API_FALLBACK_MODEL", "").strip()
 EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "0") or "0")
 OCR_API_URL = os.getenv("OCR_API_URL", "https://api.mistral.ai/v1/ocr")
 OCR_API_KEY = os.getenv("OCR_API_KEY", "")

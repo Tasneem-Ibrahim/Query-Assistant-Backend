@@ -10,35 +10,51 @@ from contextlib import contextmanager
 
 from fastapi import HTTPException
 
-from . import config
+from . import cloud, config
 
 ISSUER = "query-assistant-admin"
 
 
-def configured():
-    return bool(config.ADMIN_USERNAME and config.ADMIN_PASSWORD and config.AUTH_COOKIE_SECRET)
+SUPER_ID = "00000000-0000-4000-8000-000000000001"
+SESSION_TABLE = "/rest/v1/qa_admin_sessions"
+
+def credentials(super_admin):
+    if super_admin:
+        return config.SUPER_ADMIN_USERNAME, config.SUPER_ADMIN_PASSWORD
+    return config.ADMIN_USERNAME, config.ADMIN_PASSWORD
 
 
-def user():
+def configured(super_admin=False):
+    name, password = credentials(super_admin)
+    return bool(name and password and config.AUTH_COOKIE_SECRET and
+                (not super_admin or name != config.ADMIN_USERNAME))
+
+
+def user(super_admin=False):
+    if super_admin:
+        return {"id": SUPER_ID, "email": "", "_local_super_admin": True,
+                "user_metadata": {"name": config.SUPER_ADMIN_USERNAME}}
     return {"id": "local-admin", "email": "", "user_metadata": {"name": config.ADMIN_USERNAME}, "_local_admin": True}
 
 
-def signing_key():
+def signing_key(super_admin=False):
+    name, password = credentials(super_admin)
+    scope = "super-admin-session:" if super_admin else "admin-session:"
     return hmac.new(config.AUTH_COOKIE_SECRET.encode(),
-                    ("admin-session:" + config.ADMIN_USERNAME + ":" + config.ADMIN_PASSWORD).encode(), hashlib.sha256).digest()
+                    (scope + name + ":" + password).encode(), hashlib.sha256).digest()
 
 
 def encode(value):
     return base64.urlsafe_b64encode(value).decode().rstrip("=")
 
 
-def jwt(sid):
+def jwt(sid, super_admin=False):
     now = int(time.time())
     header = encode(b'{"alg":"HS256","typ":"JWT"}')
-    payload = encode(json.dumps({"iss": ISSUER, "sub": "local-admin", "sid": sid,
+    payload = encode(json.dumps({"iss": ISSUER, "sub": user(super_admin)["id"], "sid": sid,
                                  "iat": now, "exp": now + config.AUTH_ACCESS_SECONDS}).encode())
     body = header + "." + payload
-    return body + "." + encode(hmac.new(signing_key(), body.encode(), hashlib.sha256).digest())
+    return body + "." + encode(hmac.new(signing_key(super_admin), body.encode(), hashlib.sha256).digest())
 
 
 @contextmanager
@@ -55,59 +71,84 @@ def database():
 
 def digest(refresh):
     # Bind stored refresh tokens to current admin credentials as well.
-    return hmac.new(signing_key(), refresh.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(signing_key(refresh.startswith("super_")), refresh.encode(), hashlib.sha256).hexdigest()
 
 
 def invalid():
     return HTTPException(401, "Admin session expired. Please sign in again.")
 
 
-def create(username, password):
-    name_ok = secrets.compare_digest(username.encode(), config.ADMIN_USERNAME.encode())
-    password_ok = secrets.compare_digest(password.encode(), config.ADMIN_PASSWORD.encode())
-    if not configured() or not (name_ok and password_ok):
+def create(username, password, super_admin=False):
+    expected_name, expected_password = credentials(super_admin)
+    name_ok = secrets.compare_digest(username.encode(), expected_name.encode())
+    password_ok = secrets.compare_digest(password.encode(), expected_password.encode())
+    if not configured(super_admin) or not (name_ok and password_ok):
         raise HTTPException(401, "Admin username or password is incorrect.")
-    sid, refresh = secrets.token_urlsafe(24), "admin_" + secrets.token_urlsafe(48)
+    sid, refresh = secrets.token_urlsafe(24), ("super_" if super_admin else "admin_") + secrets.token_urlsafe(48)
     deadline = int(time.time()) + config.AUTH_SESSION_SECONDS
-    with database() as db:
-        db.execute("delete from admin_sessions where expires <= ?", (int(time.time()),))
-        db.execute("insert into admin_sessions values (?, ?, ?)", (sid, digest(refresh), deadline))
-    return {"access_token": jwt(sid), "refresh_token": refresh, "user": user()}, deadline
+    if config.CLOUD_MODE:
+        cloud._request("DELETE", SESSION_TABLE, params={"expires": f"lte.{int(time.time())}"})
+        cloud._request("POST", SESSION_TABLE, json={"id": sid, "refresh_hash": digest(refresh), "expires": deadline})
+    else:
+        with database() as db:
+            db.execute("delete from admin_sessions where expires <= ?", (int(time.time()),))
+            db.execute("insert into admin_sessions values (?, ?, ?)", (sid, digest(refresh), deadline))
+    return {"access_token": jwt(sid, super_admin), "refresh_token": refresh, "user": user(super_admin)}, deadline
 
 
 def authenticate(token, refresh):
+    super_admin = refresh.startswith("super_")
     try:
         header, payload, signature = token.split(".")
-        expected = encode(hmac.new(signing_key(), (header + "." + payload).encode(), hashlib.sha256).digest())
-        if not configured() or not hmac.compare_digest(expected, signature):
+        expected = encode(hmac.new(signing_key(super_admin), (header + "." + payload).encode(), hashlib.sha256).digest())
+        if not configured(super_admin) or not hmac.compare_digest(expected, signature):
             raise ValueError
         data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
-        if data["iss"] != ISSUER or data["sub"] != "local-admin" or data["exp"] <= time.time():
+        if data["iss"] != ISSUER or data["sub"] != user(super_admin)["id"] or data["exp"] <= time.time():
             raise ValueError
-        with database() as db:
-            row = db.execute("select id from admin_sessions where id=? and refresh_hash=? and expires>?",
-                             (data["sid"], digest(refresh), int(time.time()))).fetchone()
+        if config.CLOUD_MODE:
+            row = cloud._request("GET", SESSION_TABLE, params={
+                "select": "id", "id": "eq." + data["sid"], "refresh_hash": "eq." + digest(refresh),
+                "expires": f"gt.{int(time.time())}",
+            }).json()
+        else:
+            with database() as db:
+                row = db.execute("select id from admin_sessions where id=? and refresh_hash=? and expires>?",
+                                 (data["sid"], digest(refresh), int(time.time()))).fetchone()
         if not row:
             raise ValueError
-        return user()
+        return user(super_admin)
     except (ValueError, KeyError, TypeError):
         raise invalid() from None
 
 
 def rotate(refresh, deadline):
-    replacement = "admin_" + secrets.token_urlsafe(48)
+    super_admin = refresh.startswith("super_")
+    replacement = ("super_" if super_admin else "admin_") + secrets.token_urlsafe(48)
+    if not configured(super_admin) or deadline <= int(time.time()):
+        raise invalid()
+    if config.CLOUD_MODE:
+        rows = cloud._request("PATCH", SESSION_TABLE, params={
+            "refresh_hash": "eq." + digest(refresh), "expires": f"eq.{deadline}", "select": "id",
+        }, headers={"Prefer": "return=representation"}, json={"refresh_hash": digest(replacement)}).json()
+        if len(rows) != 1:
+            raise invalid()
+        return {"access_token": jwt(rows[0]["id"], super_admin), "refresh_token": replacement, "user": user(super_admin)}
     with database() as db:
         row = db.execute("select id, expires from admin_sessions where refresh_hash=? and expires>?",
                          (digest(refresh), int(time.time()))).fetchone()
-        if not configured() or not row or row[1] != deadline:
+        if not configured(super_admin) or not row or row[1] != deadline:
             raise invalid()
         result = db.execute("update admin_sessions set refresh_hash=? where id=? and refresh_hash=?",
                             (digest(replacement), row[0], digest(refresh)))
         if result.rowcount != 1:
             raise invalid()
-    return {"access_token": jwt(row[0]), "refresh_token": replacement, "user": user()}
+    return {"access_token": jwt(row[0], super_admin), "refresh_token": replacement, "user": user(super_admin)}
 
 
 def revoke(refresh):
+    if config.CLOUD_MODE:
+        cloud._request("DELETE", SESSION_TABLE, params={"refresh_hash": "eq." + digest(refresh)})
+        return
     with database() as db:
         db.execute("delete from admin_sessions where refresh_hash=?", (digest(refresh),))

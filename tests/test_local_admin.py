@@ -1,5 +1,7 @@
+import base64
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -7,7 +9,8 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import api_server
-from rag import config, user_auth
+from rag import config, mfa, user_auth
+from auth_helpers import complete_mfa
 
 HEADERS = {"X-CSRF-Protection": "1"}
 
@@ -16,6 +19,7 @@ class LocalAdminTests(unittest.TestCase):
         with patch.object(user_auth, 'provider', side_effect=AssertionError('Admin must not require Supabase')):
             response = self.client.post('/api/auth/login', headers=HEADERS,
                 json={'identity': config.ADMIN_USERNAME, 'password': config.ADMIN_PASSWORD, 'role': 'user'})
+            response = complete_mfa(self.client, response, 'local-admin', HEADERS)
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()['user']['role'], 'admin')
         self.assertEqual(self.client.get('/api/auth/session').json()['user']['id'], 'local-admin')
@@ -34,7 +38,7 @@ class LocalAdminTests(unittest.TestCase):
         self.addCleanup(folder.cleanup)
         settings = patch.multiple(config, ADMIN_USERNAME='Admin', ADMIN_PASSWORD='original-password',
             AUTH_COOKIE_SECRET='test-cookie-secret', AUTH_COOKIE_SECURE=False, AUTH_COOKIE_SAMESITE='lax',
-            DATA_DIR=Path(folder.name), SUPABASE_URL='', SUPABASE_ANON_KEY='', SUPABASE_SERVICE_ROLE_KEY='')
+            DATA_DIR=Path(folder.name), CLOUD_MODE=False, SUPABASE_URL='', SUPABASE_ANON_KEY='', SUPABASE_SERVICE_ROLE_KEY='')
         settings.start()
         self.addCleanup(settings.stop)
         provider = patch.object(user_auth, 'provider', side_effect=AssertionError('Admin must not contact Supabase'))
@@ -44,8 +48,9 @@ class LocalAdminTests(unittest.TestCase):
         self.addCleanup(self.client.close)
 
     def login(self, **changes):
-        return self.client.post('/api/auth/admin/login', headers=HEADERS,
+        response = self.client.post('/api/auth/admin/login', headers=HEADERS,
             json={'username': 'Admin', 'password': 'original-password', **changes})
+        return complete_mfa(self.client, response, 'local-admin', HEADERS)
 
     def test_existing_admin_login_works_without_supabase(self):
         response = self.login()
@@ -102,3 +107,22 @@ class LocalAdminTests(unittest.TestCase):
     def test_disabled_admin_fails_closed(self):
         with patch.object(config, 'ADMIN_PASSWORD', ''):
             self.assertEqual(self.login().status_code, 503)
+
+    def test_setup_gates_api_and_refresh_and_rejects_a_replayed_code(self):
+        body = {'identity': config.ADMIN_USERNAME, 'password': config.ADMIN_PASSWORD}
+        endpoint = '/api/auth/mfa/verify'
+        first = self.client.post('/api/auth/login', headers=HEADERS, json=body)
+        self.assertEqual(first.json()['mfa_required'], 'setup')
+        self.assertEqual(self.client.get('/api/domains').status_code, 401)
+        self.assertEqual(self.client.post('/api/auth/refresh', headers=HEADERS).status_code, 401)
+        key = base64.b32decode(first.json()['setup_key'])
+        # Use the forward window so crossing a time boundary does not make the code reusable.
+        code = mfa.code_for(key, int(time.time()) // 30 + 1)
+        self.assertEqual(self.client.post(endpoint, json={'code': code}).status_code, 403)
+        self.assertEqual(self.client.post(endpoint, headers=HEADERS, json={'code': code}).status_code, 200)
+        self.assertEqual(self.client.get('/api/auth/session').status_code, 200)
+
+        second = self.client.post('/api/auth/login', headers=HEADERS, json=body)
+        self.assertEqual(second.json(), {'mfa_required': 'verify'})
+        self.assertEqual(self.client.post(endpoint, headers=HEADERS, json={'code': code}).status_code, 400)
+        self.assertEqual(self.client.get('/api/auth/session').status_code, 401)

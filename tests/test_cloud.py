@@ -225,6 +225,22 @@ class APIEmbeddingTests(unittest.TestCase):
         with patch.object(httpx, "post", return_value=response):
             np.testing.assert_allclose(embed.APIEmbedder().embed_passages(["a", "b"]), [[1, 0], [0, 1]])
 
+    def test_gone_route_uses_compatible_fallback_without_changing_namespace(self):
+        def success(size):
+            return httpx.Response(200, json={"data": [
+                {"index": index, "embedding": [3, 0]} for index in range(size)
+            ]})
+
+        namespace = config.embedding_namespace()
+        with patch.object(config, "EMBEDDING_API_FALLBACK_MODEL", "compatible-model"), \
+             patch.object(httpx, "post", side_effect=[httpx.Response(410), success(16), success(1), httpx.Response(410), success(1)]) as post:
+            client = embed.APIEmbedder()
+            np.testing.assert_allclose(client.embed_passages(["passage"] * 17), [[1, 0]] * 17)
+            np.testing.assert_allclose(client.embed_query("query"), [1, 0])
+            self.assertEqual(config.embedding_namespace(), namespace)
+        self.assertEqual([call.kwargs["json"]["model"] for call in post.call_args_list],
+                         ["model-a", "compatible-model", "compatible-model", "model-a", "compatible-model"])
+
     def test_rejects_invalid_provider_vectors(self):
         for data in [[{"index": 0, "embedding": [1, 2, 3]}], [{"index": 0, "embedding": [0, 0]}], []]:
             with self.subTest(data=data), patch.object(httpx, "post", return_value=httpx.Response(200, json={"data": data})):
@@ -251,6 +267,9 @@ class CloudAPITests(unittest.TestCase):
         self.client = TestClient(api_server.app, headers={"Cookie": "qa_access=test-access", "X-CSRF-Protection": "1"})
         self.cloud_mode = patch.object(config, "CLOUD_MODE", True)
         self.cloud_mode.start()
+        activity = patch.object(api_server.security_store, "record_activity")
+        activity.start()
+        self.addCleanup(activity.stop)
         self.domain_patch = patch.object(api_server, "get_domain", return_value=Mock(key="customer_support"))
         self.domain_patch.start()
 

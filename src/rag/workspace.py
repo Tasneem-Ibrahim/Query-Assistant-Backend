@@ -3,9 +3,25 @@
 The default is the legacy admin workspace for the local CLI/Streamlit entrypoints.
 Never bind an identity from request parameters or mutate global configuration per user.
 """
+from collections import Counter
 from contextvars import ContextVar
+from threading import Lock
 from uuid import UUID
 import re
+
+_actor = ContextVar("workspace_actor", default="")
+
+def bind_actor(user):
+    return _actor.set(user["role"])
+
+
+def reset_actor(token):
+    _actor.reset(token)
+
+
+def privileged_actor():
+    return _actor.get() in {"admin", "super_admin"}
+
 
 _owner = ContextVar("workspace_owner", default="admin")
 
@@ -56,3 +72,37 @@ def local_collection(key):
 
 def owns_namespace(namespace):
     return bool(re.fullmatch(r"api_[0-9a-f]{16}" + ("_" + suffix() if suffix() else ""), namespace))
+
+
+# Keep local ingestion and HTTP mutations from racing a workspace purge in this process.
+_activity_lock = Lock()
+_writers = Counter()
+_deleting = set()
+
+
+def begin_write(owner):
+    with _activity_lock:
+        if owner in _deleting:
+            return False
+        _writers[owner] += 1
+        return True
+
+
+def end_write(owner):
+    with _activity_lock:
+        _writers[owner] -= 1
+        if not _writers[owner]:
+            del _writers[owner]
+
+
+def begin_delete(owner):
+    with _activity_lock:
+        if owner in _deleting or _writers[owner]:
+            return False
+        _deleting.add(owner)
+        return True
+
+
+def end_delete(owner):
+    with _activity_lock:
+        _deleting.remove(owner)

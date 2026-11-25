@@ -50,9 +50,9 @@ def rows(table, **filters):
         offset += len(page)
 
 
-def write(table, data, conflict):
+def write(table, data, conflict, *, headers=None):
     return _request("POST", "/rest/v1/" + table, params={"on_conflict": conflict},
-                    headers={"Prefer": "resolution=merge-duplicates,return=representation"}, json=data).json()
+                    headers={"Prefer": "resolution=merge-duplicates,return=representation", **(headers or {})}, json=data).json()
 
 
 def remove(table, **filters):

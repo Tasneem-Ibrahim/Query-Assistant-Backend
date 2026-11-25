@@ -43,7 +43,7 @@ Restart the backend and frontend after configuration. The frontend build needs o
 
 - Open the frontend: the RAG workspace stays hidden until the session is verified.
 - Choose Create an account; enter name, email, password (minimum 8 characters), and matching confirmation. Both password fields have show/hide controls.
-- If confirmation is enabled, confirm the email, return to the app, and sign in. Otherwise signup opens the workspace immediately.
+- If confirmation is enabled, confirm the email, return to the app, and sign in. Otherwise signup goes directly to authenticator setup.
 - The menu displays the user's name. Reload resumes the session using cookies. Once access expires, the next protected request refreshes and retries automatically. Concurrent requests in a tab share the refresh request.
 - Sign out revokes the Supabase refresh session and removes cookies. An expired or altered absolute-session cookie requires a fresh sign-in.
 
@@ -59,7 +59,7 @@ References: [Supabase user data](https://supabase.com/docs/guides/auth/managing-
 
 The login screen has one **Email or Username** and **Password** form, without a separate admin option. `POST /api/auth/login` accepts `identity` and `password`; legacy `email` payloads remain supported. The backend matches the configured admin username and verifies the original `ADMIN_USERNAME`/`ADMIN_PASSWORD`, without Supabase signup. Email identities continue through Supabase Auth. Unknown usernames and wrong credentials return the same generic 401; client role fields and user metadata cannot grant admin access. The legacy `/api/auth/admin/login` API remains secured for backwards compatibility but is not used or displayed by the UI.
 
-Admin sessions retain signed 15-minute JWTs and seven-day refresh sessions, with only keyed refresh-token hashes in `DATA_DIR/admin_sessions.sqlite3`. Refresh rotation, revocation and credential-change invalidation are unchanged. Successful login (or signup with an immediate session) always navigates to `index.html`, even when submitted from a workspace URL. Both roles see the same Homepage and **Dashboard** button: verified Admin sessions open `dashboard.html`, regular User sessions open `workspace.html`. Already authenticated page reloads resume that page. Backend checks continue to enforce permissions and private data ownership independently of UI navigation. Signup remains email-only with existing confirmation behavior.
+Admin sessions retain signed 15-minute JWTs and seven-day refresh sessions. Keyed refresh-token hashes live in `DATA_DIR/admin_sessions.sqlite3` in local mode and in the service-role-only `qa_admin_sessions` table in Supabase mode. After two-factor verification the app navigates to `index.html`, even when sign-in starts from a workspace URL. Verified Admins open `dashboard.html` from the Homepage, and regular Users open `workspace.html`. Already authenticated page reloads resume the current page. Signup remains email-only with existing confirmation behavior.
 
 The local admin session store requires persistent storage shared by backend workers. On Vercel the current `DATA_DIR` is temporary and per-instance; use a persistent shared session store before relying on admin session persistence across serverless instances. Admin login credentials must also be configured in the deployment environment; editing the local `.env` does not update Vercel.
 
@@ -88,3 +88,93 @@ No database tables, records, private files or existing attempt counts are droppe
 by the transition migration. Frontend/backend must be deployed together. Existing
 OCR setup, Vercel request limits and serverless admin-session persistence remain
 independent limitations. No live deployment/provider checks have been performed.
+
+## Super Admin rollout
+
+1. Apply [supabase/super_admin.sql](supabase/super_admin.sql) after the existing
+   auth, workspace isolation, admin panel, and saved-upload migrations. It
+   adds a service-role-only audit table and account-management functions.
+2. Set SUPER_ADMIN_USERNAME and SUPER_ADMIN_PASSWORD in the backend
+   environment. The unified Email or Username form accepts the configured
+   Super Admin login. Existing local Admin credentials stay in their
+   original variables. Supabase-managed Admins continue signing in by email.
+3. Apply the security migration below, then restart the backend and build
+   or deploy both applications together.
+
+The Permission Matrix edits managed role defaults and account overrides.
+Permissions List enables or disables whole modules for a managed role. A
+disabled module blocks its actions even for accounts with overrides. The
+original Admin has separately editable permissions in the Admin tab of the
+Permission Matrix. Role Management can pause or resume its workspace access
+while its environment-backed sign-in stays available. Super Admin can grant
+or revoke an Admin's upload approval access from the account row. Role
+assignment, permission changes for other accounts, workspace selection, and
+permanent account deletion require Super Admin. Existing upload approval
+policy continues to apply to regular User uploads.
+
+To let an Admin add or delete files for an active User, enable the relevant
+**User uploads** actions in the Permission Matrix. View is required to open
+the upload manager. The Admin also needs User details and Knowledge bases View
+and the corresponding Documents action. From **All users**, select a User and
+choose **Manage uploads**. The manager lists that user's knowledge bases and
+files and processes changes in that user's workspace. Document preview, chat,
+search, and knowledge-base changes are outside this delegated access.
+
+Apply [supabase/admin_upload_approvals.sql](supabase/admin_upload_approvals.sql)
+after the upload and browser-processing migrations to enable the new approval
+request actions. Super Admin can grant **Upload approvals → Add** and **Delete**
+in the Admin Permission Matrix. **Add approval request** is under **All users →
+selected user → upload requests**. Delete removes the approval request from the
+lists and leaves registered documents in place. Requests with an active
+processing lease can be removed after processing releases that lease.
+
+Deactivate blocks access and retains workspace data. Permanent deletion
+clears the account's application records, private files, and search collections
+in the configured providers and removes the Supabase Auth account. Audit
+history retains the action and target ID. If processing is still finishing or a
+provider fails during deletion, retry from Role Management. Check rollout
+with a disposable account before using permanent deletion on real data.
+
+### Managed Admin role and invitations
+
+Apply [supabase/super_admin_roles.sql](supabase/super_admin_roles.sql) after
+super_admin.sql. Role Management can then deactivate the managed Admin role
+without removing accounts or workspace data. The server checks the role's
+status on sign-in, session refresh, and authenticated API requests. Reactivate
+the role or reassign affected accounts to User to restore access. The original
+environment-backed Admin account remains available.
+
+Create or invite an account from Role Management by selecting User or Admin,
+then setting its permissions. An invitation generates a one-time link to copy
+and share privately. The invitee opens the link and chooses a password. Supabase
+verifies the invite token and stores the password. The invitee must set up 2FA
+before the app issues a workspace session.
+
+### Mandatory two-factor sign-in and login logs
+
+In Supabase mode, apply [supabase/security_settings.sql](supabase/security_settings.sql)
+before starting the updated backend. It persists authenticator enrollment, login
+logs, managed-role permissions and environment-backed admin sessions. Local mode
+creates its SQLite databases on first use. Keep the same private `AUTH_COOKIE_SECRET`
+across instances and restarts. Changing it invalidates existing sessions and
+requires coordinated authenticator re-enrollment.
+
+An existing browser session must sign in again after this update. Each account
+enrolls once by scanning the QR code or entering the manual time-based key,
+then confirms a six-digit code.
+Subsequent sign-ins prompt for a fresh code. Setup and verification attempts
+expire after five minutes. Sign-in still uses the original environment
+credentials for Admin and Super Admin, and Supabase Auth for managed accounts.
+
+For a lost authenticator, verify the account holder through your usual support
+process, then clear the affected `factor:<account ID>` key from
+`public.qa_security_state` (Supabase) or the `security_state` table in
+`DATA_DIR/security.sqlite3` (local). Use `local-admin` for the original Admin
+and `00000000-0000-4000-8000-000000000001` for Super Admin. The next
+password sign-in prompts for a new setup. If the account may be compromised,
+also revoke its sessions and change its password.
+
+Super Admin can browse Login Logs and export them as CSV. Logs record the
+timestamp, account ID when known, role when known, and outcome. The app keeps
+prior entries for audit when an account is deleted. Workspace documents and
+authenticator details are excluded from the log.
