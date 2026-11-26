@@ -49,6 +49,23 @@ Redeploy the backend after saving the Production variable. Start sign-in again
 and use a fresh code at the next authenticator rollover. Check this configuration
 before resetting any enrollment. Keep the secret in backend environment settings.
 
+## Questions or uploads fail with embedding HTTP 410
+
+For a backend configured with `EMBEDDING_API_MODEL=nvidia/nemotron-3-embed-1b:free`
+and `EMBEDDING_DIMENSIONS=2048`, set the following variable in the backend Vercel
+project's Production environment:
+
+```dotenv
+EMBEDDING_API_FALLBACK_MODEL=nvidia/nemotron-3.5-embed-1b:free
+```
+
+Keep the existing primary model, endpoint and dimensions to preserve the
+Qdrant namespace. [OpenRouter documents](https://openrouter.ai/nvidia/nemotron-3.5-embed-1b:free)
+that the fallback shares the primary model's text embedding space and returns
+2048 dimensions. Redeploy the backend and retry a question against an existing
+indexed document. If it still fails, check the backend deployment logs for the
+embedding request error.
+
 ## Processing and limits
 
 Vercel uploads are limited here to **4,000,000 bytes per PDF**, leaving room for
