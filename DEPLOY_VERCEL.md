@@ -35,6 +35,20 @@ Mistral-compatible OCR API. Qdrant Cloud continues to store vectors.
    Upload an image PDF to verify OCR. Delete one PDF and verify the other
    document's vectors and saved file remain intact.
 
+## Authenticator codes fail only on Vercel
+
+If local sign-in succeeds and Production rejects authenticator codes for
+multiple roles, confirm both backends use the same Supabase project and
+`STORAGE_BACKEND=supabase`. When both environments share authenticator
+enrollments, set the backend's Production `AUTH_COOKIE_SECRET` to the exact
+existing value from the environment where the enrolled authenticator works.
+If omitted, the backend falls back to the Supabase service-role key, which can
+derive a different authenticator key from the same saved enrollment.
+
+Redeploy the backend after saving the Production variable. Start sign-in again
+and use a fresh code at the next authenticator rollover. Check this configuration
+before resetting any enrollment. Keep the secret in backend environment settings.
+
 ## Processing and limits
 
 Vercel uploads are limited here to **4,000,000 bytes per PDF**, leaving room for
