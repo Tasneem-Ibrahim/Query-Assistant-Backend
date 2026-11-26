@@ -42,12 +42,11 @@ app.include_router(admin_panel.router)
 app.include_router(super_admin.router)
 
 ACTIVITY_ROUTES = {
+    ("POST", "/api/super-admin/user-details"): ("user-details", "Created or invited User"),
     ("POST", "/api/super-admin/accounts"): ("user-details", "Created or invited account"),
     ("DELETE", "/api/super-admin/accounts/{owner}"): ("user-details", "Permanently deleted account"),
     ("PUT", "/api/super-admin/original-admin/status"): ("user-details", "Updated original Admin access status"),
     ("PUT", "/api/admin/users/{user_id}/permissions"): ("user-details", "Updated account upload policy"),
-    ("PUT", "/api/super-admin/permission-settings/{role}"): ("role-management", "Updated role permissions"),
-    ("PUT", "/api/super-admin/original-admin/permissions"): ("role-management", "Updated original Admin permissions"),
     ("PUT", "/api/super-admin/accounts/{owner}/upload-approval"): ("role-management", "Updated upload approval access"),
     ("PUT", "/api/super-admin/roles/admin"): ("role-management", "Updated Admin role status"),
     ("POST", "/api/domains"): ("knowledge-base", "Created knowledge base"),
@@ -280,12 +279,15 @@ async def ingest_endpoint(
     """
     domain = _domain(key)
 
-    delegated_upload = request.state.user["role"] == "admin" and request.headers.get("x-workspace-account")
+    delegated_upload = request.state.user["role"] != "super_admin" and request.headers.get("x-workspace-account")
     if delegated_upload and (force or file is None or not file.filename):
         raise HTTPException(400, "Select a PDF or image to add to this user workspace.")
 
     if force and not access_control.allows(request.state.user, "documents.edit"):
         raise HTTPException(403, "Editing documents is disabled for your account.")
+
+    if not delegated_upload and workspace.owner_id() == "admin" and request.state.user.get("direct_upload_restricted"):
+        raise HTTPException(403, "Direct uploads are disabled for this account.")
 
     # Enforce approval before storage, extraction, embedding or processing.
     if file is not None and file.filename:

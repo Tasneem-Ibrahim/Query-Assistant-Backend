@@ -83,3 +83,61 @@ References: [Vercel FastAPI](https://vercel.com/docs/frameworks/backend/fastapi)
 [Vercel limits](https://vercel.com/docs/functions/limitations),
 [Supabase REST API](https://supabase.com/docs/guides/api),
 [Mistral OCR](https://docs.mistral.ai/studio/document-processing/basic_ocr).
+
+## Hierarchical permissions rollout
+
+Apply the existing security settings, Super Admin, role, upload approval,
+activity-log and revision migrations first. Then apply
+[hierarchical_permissions.sql](supabase/hierarchical_permissions.sql) and
+[scoped_authority.sql](supabase/scoped_authority.sql), followed by
+[audit_administration.sql](supabase/audit_administration.sql).
+Deploy the backend and frontend together with `STORAGE_BACKEND=supabase`.
+No new environment variables are required.
+
+Admin and User share the same action catalog. A role module explicitly disabled
+in Permissions List applies that gate to every account in the role. A module
+toggle preserves action settings, and individual overrides can enable an
+opt-in module when the role has no explicit denial. Under Permission Matrix,
+select an individual account and save its delegated account scope separately
+from its actions. Existing credentials and records are preserved. Enable scope
+for previously delegated accounts before they perform targeted account writes.
+
+Delegated role assignments and account changes require the relevant action and
+target scope. Delegates cannot assign scopes, alter their own account authority,
+or manage protected accounts. Shared administrative defaults and global role
+suspension are reserved for Super Admin to prevent indirect self-escalation and
+site-wide lockouts. Role definitions are fixed. Role Management Delete removes
+Admin assignment. User Details Delete permanently deletes a scoped, inactive
+account. Creation and permanent deletion are audit events that cannot be reversed.
+Audit View grants are site-wide.
+
+Stage the SQL and verify scoped promotion and demotion, dynamic revocation,
+concurrent stale-authority rejection, audit and revision entries, and reversal
+with all three roles. PostgreSQL policy checks run at delegated settings writes,
+and RLS keeps workspace and administrative tables inaccessible to direct browser
+writes. Requests already in progress may finish. Local SQLite with Supabase Auth
+does not provide a single cross-store transaction. Keep the service-role key
+server-side.
+
+### Administrative actions
+
+User Details Add creates or invites a User with current role defaults. A delegate
+needs User Details View/Add, scope for User accounts, and enough authority for
+the effective permissions the new User would inherit. Role Management handles
+Admin creation and role assignments.
+
+Permission Matrix Add writes a new explicit action setting, Edit changes an
+existing one, and Delete removes it so the inherited value applies. Existing
+delegates with Edit need an explicit Add or Delete grant for the corresponding
+setting operations. Module switches still use Permission Edit.
+
+Logs and Revisions use an append-only journal. Log corrections attach to the
+original event and show the correcting actor and time. Delete archives a record
+from the active view, and restores require the same authority. Include archived
+reveals those records, and the raw login CSV still exports original events.
+Manual revisions document decisions separately from reversible settings
+snapshots. All journal operations append a Role Management activity event.
+Delegated audit writes require a scoped account. Global records, records without
+a resolvable account, and protected or self accounts are reserved for Super
+Admin. Verify journal authorization, archive/restore, and old audit and revision
+visibility during staging.

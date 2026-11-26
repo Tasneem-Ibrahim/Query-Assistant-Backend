@@ -49,7 +49,7 @@ def queue_saved_upload(request_id, object_path, mode):
             'job_state':'queued','job_message':'Your file is saved. Processing starts when your Dashboard is open.'}).json()
 
 
-def save(domain, filename, content, message='', use_llm=True, *, request_approval=False, direct_upload=False):
+def save(domain, filename, content, message='', use_llm=True, *, request_approval=False, direct_upload=None):
     from .admin_panel import upload_mode
     from .extract import SUPPORTED_EXTENSIONS
     owner = workspace.owner_id()

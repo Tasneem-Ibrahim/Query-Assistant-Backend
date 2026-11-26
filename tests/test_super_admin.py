@@ -66,6 +66,7 @@ class SuperAdminTests(unittest.TestCase):
         from rag import security_store
         security_store.write("account:local-admin", {
             "user_uploads.view": True, "user_uploads.add": True, "user_uploads.delete": True,
+            "scope:role:user": True,
         }, 0)
         headers = {**HEADERS, "X-Workspace-Account": OWNER}
         domain = SimpleNamespace(pdf_dir=self.root / "selected-user", key="example")
@@ -80,10 +81,10 @@ class SuperAdminTests(unittest.TestCase):
             self.assertEqual(self.client.get("/api/domains", headers=headers).status_code, 200)
             self.assertEqual(self.client.delete("/api/domains/example/documents/test", headers=headers).status_code, 200)
             delete.assert_called_once()
-            self.assertEqual(self.client.get("/api/domains/example/documents/test/pdf", headers=headers).status_code, 403)
+            self.assertEqual(self.client.get("/api/domains/example/documents/test", headers=headers).status_code, 403)
             self.assertEqual(self.client.post("/api/domains/example/ingest", headers=headers).status_code, 400)
             self.assertEqual(self.client.post("/api/domains/example/reset", headers=headers).status_code, 403)
-            with patch.object(api_server.extract, "document_pdf"), patch.object(api_server.ingest, "ingest_pdf", side_effect=ingest_selected):
+            with patch.object(api_server.extract, "document_pdf"), patch.object(api_server.ingest, "ingest_pdf", side_effect=ingest_selected), patch("rag.admin_panel.cloud.rows", return_value=[]):
                 files = {"file": ("delegated.pdf", b"test PDF", "application/pdf")}
                 result = self.client.post("/api/domains/example/ingest", headers=headers, files=files)
                 self.assertEqual(result.json(), {"type": "done", "report": {"name": "delegated.pdf"}})
@@ -148,7 +149,407 @@ class SuperAdminTests(unittest.TestCase):
                 self.assertEqual([access_control.allows(account, key) for key in keys], [enabled] * len(keys))
                 self.assertFalse(access_control.allows(account, "approvals.delete"))
         with self.assertRaises(HTTPException):
-            super_admin.validate_permissions("user", {"approvals.edit": True})
+            super_admin.validate_permissions("user", {"logs.export": True})
+
+    def test_delegated_admin_role_defaults_module_gate_revocation_and_audit(self):
+        self.sign_in_super()
+        endpoint = "/api/super-admin/permission-settings"
+        original = "/api/super-admin/original-admin/permissions"
+        grant = {"permissions.view": True, "permissions.add": True, "permissions.edit": True, "documents.delete": False,
+                 "logs.view": True, "revisions.view": True, "scope:role:user": True, "scope:policy:user": True}
+        self.assertEqual(self.client.put(original, headers=HEADERS, json={"permissions": grant, "revision": 0}).status_code, 200)
+        with TestClient(api_server.app) as admin:
+            login = admin.post("/api/auth/login", headers=HEADERS,
+                               json={"identity": config.ADMIN_USERNAME, "password": config.ADMIN_PASSWORD})
+            self.assertEqual(complete_mfa(admin, login, "local-admin", HEADERS).status_code, 200)
+            with patch.object(super_admin, "list_accounts", return_value=[{"id": OTHER, "role": "admin"}, {"id": OWNER, "role": "user"}]):
+                snapshot = admin.get(endpoint).json()
+            self.assertEqual(set(snapshot["editable_roles"]), {"user"})
+            self.assertEqual([person["id"] for person in snapshot["accounts"]], [OWNER])
+            self.assertNotIn("documents.delete", snapshot["delegation_scope"])
+            def save(client, role, modules, actions, revision):
+                return client.put(endpoint + "/" + role, headers=HEADERS,
+                                  json={"modules": modules, "actions": actions, "revision": revision})
+
+            self.assertEqual(save(admin, "admin", {}, {}, 0).status_code, 403)
+            self.assertEqual(save(admin, "user", {"documents": False}, {}, 0).status_code, 403)
+            self.assertEqual(save(admin, "user", {}, {"documents.delete": True}, 0).status_code, 403)
+            self.assertEqual(save(admin, "user", {"bases": False}, {"bases.add": False}, 0).status_code, 200)
+            settings = {"id": OWNER, "role": "user", "permissions": {"bases.view": True}}
+            self.assertFalse(access_control.effective(settings)["bases.view"])
+            self.assertEqual(save(admin, "user", {"bases": True}, {"bases.add": False}, 1).status_code, 200)
+            self.assertTrue(access_control.effective(settings)["bases.view"])
+            self.assertFalse(access_control.effective(settings)["bases.add"])
+
+            self.assertEqual(save(self.client, "user", {"bases": False}, {"bases.add": False}, 2).status_code, 200)
+            self.assertEqual(save(admin, "user", {"bases": True}, {"bases.add": False}, 3).status_code, 403)
+            self.assertEqual(admin.get("/api/super-admin/login-logs").status_code, 200)
+            with patch("rag.revisions.cloud._request", side_effect=ValueError("Offline test")):
+                history = admin.get("/api/super-admin/revisions").json()["revisions"]
+            edit = next(item for item in history if item["actor_id"] == "local-admin")
+            self.assertEqual(edit["before_state"]["modules"], {"bases": False})
+            self.assertEqual(edit["after_state"]["modules"], {"bases": True})
+            reverse = "/api/super-admin/revisions/" + history[0]["revision_id"] + "/reverse"
+            self.assertEqual(admin.post(reverse, headers=HEADERS).status_code, 403)
+            self.assertEqual(self.client.post(reverse, headers=HEADERS).status_code, 200)
+            self.assertEqual(self.client.put(original, headers=HEADERS, json={
+                "permissions": {**grant, "revisions.edit": True}, "revision": 1,
+            }).status_code, 200)
+            self.assertEqual(admin.post(reverse, headers=HEADERS).status_code, 403)
+            own_reverse = "/api/super-admin/revisions/" + edit["revision_id"] + "/reverse"
+            self.assertEqual(admin.post(own_reverse, headers=HEADERS).status_code, 200)
+            self.assertEqual(admin.post(own_reverse, headers=HEADERS).status_code, 409)
+            events = admin.get("/api/super-admin/activity-logs/role-management").json()["events"]
+            self.assertTrue(any(event["actor_id"] == "local-admin" for event in events))
+
+            self.assertEqual(save(self.client, "admin", {"permissions": False}, {}, 0).status_code, 200)
+            self.assertEqual(admin.get(endpoint).status_code, 403)
+            self.assertEqual(save(admin, "user", {}, {}, 5).status_code, 403)
+            self.assertEqual(admin.get("/api/auth/session").status_code, 200)
+
+    def test_delegated_account_overrides_and_user_api_are_scoped(self):
+        self.sign_in_super()
+        policy = "/api/super-admin/permission-settings"
+        self.assertEqual(self.client.put(policy + "/admin", headers=HEADERS, json={
+            "modules": {}, "actions": {"permissions.view": True, "permissions.add": True, "permissions.edit": True, "documents.delete": False},
+            "revision": 0,
+        }).status_code, 200)
+        self.assertEqual(self.client.put(policy + "/user", headers=HEADERS, json={
+            "modules": {"accounts": True}, "actions": {"accounts.view": False}, "revision": 0,
+        }).status_code, 200)
+
+        managed = {"id": OTHER, "app_metadata": {"qa_access": {"role": "admin", "permissions": {"scope:" + OWNER: True}}}}
+        person = {"id": OWNER, "app_metadata": {"qa_access": {"role": "user"}}}
+        caller = managed
+
+        async def authenticate(request):
+            request.state.user = await user_auth.active_profile(caller)
+
+        def provider(method, path, **kwargs):
+            self.assertEqual(path, "/rest/v1/rpc/qa_update_delegated_account")
+            self.assertIn("X-QA-Delegation", kwargs["headers"])
+            self.assertEqual(kwargs["headers"]["X-QA-Revision-Actor"], OTHER)
+            person["app_metadata"]["qa_access"] = kwargs["json"]["p_next"]
+            return Mock(**{"json.return_value": True})
+
+        target = "/api/super-admin/accounts/" + OWNER
+        with patch.object(user_auth, "authenticate", side_effect=authenticate), patch.object(
+            super_admin, "auth", side_effect=lambda method, path: managed if path.endswith(OTHER) else person,
+        ), patch.object(access_control, "managed_admin_active", return_value=True), patch.object(
+            super_admin.cloud, "_request", side_effect=provider,
+        ) as update:
+            for target_path, payload in (
+                (target, {"role": "admin"}),
+                (target, {"permissions": {"documents.delete": True}}),
+                (target, {"permissions": {"accounts.view": True}}),
+                (target, {"permissions": {"roles.edit": True}}),
+                (target.replace(OWNER, OTHER), {"permissions": {}}),
+            ):
+                self.assertEqual(self.client.patch(target_path, headers=HEADERS, json=payload).status_code, 403)
+            update.assert_not_called()
+            self.assertEqual(self.client.patch(target, headers=HEADERS, json={
+                "permissions": {"module:bases": False, "bases.add": False}, "expected_permissions": {},
+            }).status_code, 200)
+            self.assertEqual(self.client.patch(target, headers=HEADERS, json={
+                "permissions": {}, "expected_permissions": {},
+            }).status_code, 409)
+
+            caller = person
+            self.assertEqual(self.client.get("/api/domains").status_code, 403)
+            self.assertEqual(self.client.get(policy).status_code, 403)
+            self.assertEqual(self.client.get("/api/super-admin/login-logs").status_code, 403)
+            self.assertEqual(self.client.patch(target, headers=HEADERS, json={"permissions": {}}).status_code, 403)
+
+            caller = managed
+            self.assertEqual(self.client.patch(target, headers=HEADERS, json={
+                "permissions": {"bases.add": False},
+            }).status_code, 200)
+            caller = person
+            self.assertEqual(self.client.get("/api/domains").status_code, 200)
+            self.assertEqual(self.client.post("/api/domains", headers=HEADERS, json={"name": "Denied"}).status_code, 403)
+
+    def test_cloud_delegation_uses_live_authority_snapshot_and_fails_closed_on_conflict(self):
+        import json
+        from rag import cloud, security_store
+        settings = {
+            "policy:admin": ({"actions": {"permissions.view": True, "permissions.edit": True}}, 4),
+            "policy:user": ({}, 0),
+            "account:local-admin": ({"scope:policy:user": True}, 2),
+            "status:local-admin": ({"active": True}, 3),
+        }
+
+        async def authenticate(request):
+            request.state.user = await user_auth.active_profile({
+                "id": "local-admin", "_local_admin": True,
+            })
+
+        with patch.object(config, "CLOUD_MODE", True), patch.object(
+            user_auth, "authenticate", side_effect=authenticate
+        ), patch.object(security_store, "read", side_effect=settings.__getitem__), patch.object(
+            cloud, "_request", side_effect=cloud.DelegationConflict("Permission settings changed.")
+        ) as rpc:
+            response = self.client.put("/api/super-admin/permission-settings/user", headers=HEADERS, json={
+                "modules": {"bases": False}, "actions": {}, "revision": 0,
+            })
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(rpc.call_args.args[1], "/rest/v1/rpc/qa_write_delegated_policy")
+        snapshot = json.loads(rpc.call_args.kwargs["headers"]["X-QA-Delegation"])
+        self.assertEqual(snapshot["state"], {key: revision for key, (_, revision) in settings.items()})
+        self.assertEqual(snapshot["scope"], ["policy:user"])
+        self.assertIn("permissions.edit", snapshot["allowed"])
+
+    def test_audit_journal_operations_are_scoped_and_preserve_originals(self):
+        from rag import audit_journal, revisions, security_store
+        operator = "66666666-6666-4666-8666-666666666666"
+        security_store.log({"id": OWNER, "role": "user"}, "signed_in")
+        security_store.log({"id": OTHER, "role": "user"}, "signed_out")
+        with revisions.database() as db:
+            db.execute("""insert into setting_revisions
+                (created_at,kind,target,actor_id,before_state,after_state)
+                values('2026-11-26T00:00:00+00:00','account',?,?,'{}','{}')""", (OWNER, admin_sessions.SUPER_ID))
+        grant = {key: True for key in ("logs.view", "logs.add", "logs.edit", "logs.delete",
+                                      "revisions.view", "revisions.add", "revisions.delete")}
+        admin = {"id": operator, "app_metadata": {"qa_access": {"role": "admin",
+                 "permissions": {**grant, "scope:" + OWNER: True}}}}
+        user = {"id": OTHER, "app_metadata": {"qa_access": {"role": "user", "permissions": {
+            "logs.view": True, "logs.add": True, "revisions.view": True, "revisions.add": True, "scope:" + OWNER: True,
+        }}}}
+        caller = admin
+
+        async def authenticate(request):
+            request.state.user = ({"role": "super_admin", "id": admin_sessions.SUPER_ID}
+                                  if caller is None else await user_auth.active_profile(caller))
+
+        def auth(method, path):
+            owner = path.split("/")[-1]
+            return admin if owner == operator else user if owner == OTHER else {"id": OWNER}
+
+        root = "/api/super-admin/audit-journal/"
+        note = {"note": "Verified original record"}
+        with patch.object(user_auth, "authenticate", side_effect=authenticate), patch.object(
+            super_admin, "auth", side_effect=auth
+        ), patch.object(access_control, "managed_admin_active", return_value=True):
+            first = self.client.post(root + "logs", headers=HEADERS, json={**note, "subject": OWNER})
+            self.assertEqual(first.status_code, 201, first.text)
+            self.assertEqual(self.client.post(root + "logs", headers=HEADERS,
+                             json={**note, "subject": OTHER}).status_code, 403)
+            self.assertEqual(self.client.patch(root + "logs/login:2", headers=HEADERS, json=note).status_code, 403)
+            self.assertEqual(self.client.patch(root + "logs/login:1", headers=HEADERS, json=note).status_code, 200)
+            failed = self.client.request("DELETE", root + "logs/login:999", headers=HEADERS, json=note)
+            self.assertEqual(failed.status_code, 404)
+            archived = self.client.request("DELETE", root + "logs/login:1", headers=HEADERS, json=note)
+            self.assertEqual(archived.status_code, 200)
+            duplicate = self.client.request("DELETE", root + "logs/login:1", headers=HEADERS, json=note)
+            self.assertEqual(duplicate.status_code, 409)
+            annotations = self.client.post(root + "logs/annotations", headers=HEADERS, json={"references": ["login:1"]})
+            self.assertTrue(annotations.json()["login:1"]["archived"])
+            self.assertEqual(annotations.json()["login:1"]["correction"]["note"], note["note"])
+            raw = self.client.get("/api/super-admin/login-logs").json()["events"]
+            self.assertEqual(next(row for row in raw if row["id"] == 1)["outcome"], "signed_in")
+            self.assertIn("signed_in", self.client.get("/api/super-admin/login-logs.csv").text)
+
+            caller = user
+            manual = self.client.post(root + "revisions", headers=HEADERS, json={**note, "subject": OWNER})
+            self.assertEqual(manual.status_code, 201)
+            self.assertEqual(self.client.post(root + "logs/login:1/restore", headers=HEADERS, json=note).status_code, 403)
+            self.assertEqual(self.client.request("DELETE", root + "revisions/revision:L:1", headers=HEADERS, json=note).status_code, 403)
+            caller = admin
+            self.assertEqual(self.client.request("DELETE", root + "revisions/revision:L:1", headers=HEADERS, json=note).status_code, 200)
+            caller = None
+            self.assertEqual(self.client.post(root + "logs/login:1/restore", headers=HEADERS, json=note).status_code, 200)
+            self.assertEqual(self.client.post(root + "revisions", headers=HEADERS, json=note).status_code, 201)
+
+        with revisions.database() as db:
+            self.assertEqual(db.execute("select target from setting_revisions where id=1").fetchone()["target"], OWNER)
+        self.assertFalse(audit_journal.states("logs", ["login:1"])["login:1"]["archived"])
+        self.assertEqual([entry["operation"] for entry in audit_journal.history("logs")["entries"]],
+                         ["restore", "archive", "correct", "add"])
+        events = security_store.activity_events("role-management", 50)
+        self.assertEqual(len(events), 7)
+        self.assertEqual({event["actor_id"] for event in events}, {operator, OTHER, admin_sessions.SUPER_ID})
+
+    def test_permission_add_edit_delete_are_independent_for_scoped_user(self):
+        person = {"id": OTHER, "app_metadata": {"qa_access": {"role": "user"}}}
+        owner = {"id": OWNER, "app_metadata": {"qa_access": {"role": "user", "permissions": {
+            "permissions.view": True, "permissions.add": True, "scope:" + OTHER: True,
+        }}}}
+        grants = owner["app_metadata"]["qa_access"]["permissions"]
+
+        async def authenticate(request):
+            request.state.user = await user_auth.active_profile(owner)
+
+        def persist(method, path, **kwargs):
+            settings = kwargs["json"]["p_next"]
+            person["app_metadata"]["qa_access"] = settings
+            return Mock(**{"json.return_value": True})
+
+        with patch.object(user_auth, "authenticate", side_effect=authenticate), patch.object(
+            super_admin, "auth", side_effect=lambda method, path: owner if path.endswith(OWNER) else person,
+        ), patch.object(super_admin.cloud, "_request", side_effect=persist):
+            path = "/api/super-admin/accounts/" + OTHER
+            def save(values):
+                return self.client.patch(path, headers=HEADERS, json={"permissions": values})
+
+            self.assertEqual(save({"bases.add": True}).status_code, 200)
+            self.assertEqual(save({"bases.add": False}).status_code, 403)
+            self.assertEqual(save({}).status_code, 403)
+            grants.update({"permissions.add": False, "permissions.edit": True})
+            self.assertEqual(save({"bases.add": False}).status_code, 200)
+            self.assertEqual(save({"bases.add": False, "bases.view": True}).status_code, 403)
+            grants.update({"permissions.edit": False, "permissions.delete": True})
+            self.assertEqual(save({}).status_code, 200)
+            self.assertEqual(person["app_metadata"]["qa_access"]["permissions"], {})
+            self.assertEqual(save({"bases.add": False}).status_code, 403)
+
+    def test_user_details_add_creates_user_without_role_management(self):
+        actor = {"id": OTHER, "app_metadata": {"qa_access": {"role": "user", "permissions": {
+            "module:accounts": True, "accounts.view": True, "accounts.add": True, "scope:role:user": True,
+        }}}}
+
+        async def authenticate(request):
+            request.state.user = await user_auth.active_profile(actor)
+
+        def auth(method, path, **kwargs):
+            if method == "GET":
+                return actor
+            return {"id": OWNER, "email": "new@example.com", "app_metadata": kwargs["json"]["app_metadata"]}
+
+        payload = {"name": "New User", "email": "new@example.com", "password": "test-password"}
+        with patch.object(user_auth, "authenticate", side_effect=authenticate), patch.object(
+            super_admin, "auth", side_effect=auth
+        ), patch.object(super_admin.cloud, "_request"):
+            result = self.client.post("/api/super-admin/user-details", headers=HEADERS, json=payload)
+            self.assertEqual(result.status_code, 201, result.text)
+            self.assertEqual(result.json()["role"], "user")
+            self.assertEqual(self.client.post("/api/super-admin/accounts", headers=HEADERS, json=payload).status_code, 403)
+            self.assertEqual(self.client.post("/api/super-admin/user-details", headers=HEADERS,
+                             json={**payload, "role": "admin"}).status_code, 422)
+            del actor["app_metadata"]["qa_access"]["permissions"]["scope:role:user"]
+            self.assertEqual(self.client.post("/api/super-admin/user-details", headers=HEADERS, json=payload).status_code, 403)
+
+    def test_same_catalog_and_module_switches_for_both_roles(self):
+        self.sign_in_super()
+        endpoint = "/api/super-admin/permission-settings"
+        with patch.object(super_admin, "list_accounts", return_value=[]):
+            catalog = self.client.get(endpoint).json()
+        self.assertEqual(catalog["assignable"]["admin"], catalog["assignable"]["user"])
+        actions = dict.fromkeys(catalog["assignable"]["user"], True)
+        modules = dict.fromkeys(catalog["resources"], True)
+        for role in ("admin", "user"):
+            person = {"id": OWNER, "role": role, "permissions": {}}
+            for revision, enabled in enumerate((True, False, True)):
+                values = {**modules, "roles": enabled}
+                saved = self.client.put(endpoint + "/" + role, headers=HEADERS,
+                    json={"revision": revision, "modules": values, "actions": actions})
+                self.assertEqual(saved.status_code, 200, saved.text)
+                effective = access_control.effective(person)
+                self.assertEqual(effective["roles.edit"], enabled)
+                self.assertTrue(effective["permissions.edit"])
+                self.assertTrue(effective["logs.view"])
+                self.assertTrue(effective["logs.delete"])
+        explicit = {"actions": {"roles.view": True}, "modules": {"roles": False}}
+        self.assertFalse(access_control.effective({"id": OWNER, "role": "user", "permissions": {
+            "module:roles": True, "roles.view": True,
+        }}, explicit)["roles.view"])
+
+    def test_user_can_manage_scoped_roles_without_a_role_change(self):
+        third = "66666666-6666-4666-8666-666666666666"
+        actor = {"id": OWNER, "app_metadata": {"qa_access": {"role": "user"}}}
+        target = {"id": OTHER, "app_metadata": {"qa_access": {"role": "user"}}}
+        outside = {"id": third, "app_metadata": {"qa_access": {"role": "user"}}}
+        people = {person["id"]: person for person in (actor, target, outside)}
+        endpoint = "/api/super-admin/accounts/"
+        actor_provider = actor
+
+        async def authenticate(request):
+            request.state.user = ({"role": "super_admin", "id": admin_sessions.SUPER_ID}
+                                  if actor_provider is None else await user_auth.active_profile(actor_provider))
+
+        def auth(method, path):
+            return {"users": list(people.values())} if not path else people[path.removeprefix("/")]
+
+        def save(method, path, **kwargs):
+            body = kwargs["json"]
+            person = people[body["p_user"]]
+            self.assertEqual(person["app_metadata"]["qa_access"], body["p_previous"])
+            person["app_metadata"]["qa_access"] = body["p_next"]
+            return Mock(**{"json.return_value": True})
+
+        partial = {"roles.view": True, "permissions.view": True, "permissions.add": True, "permissions.edit": True,
+                   "scope:" + OTHER: True}
+        full = {key: True for key in access_control.grant_scope({"role": "super_admin"})}
+        full.update({"module:" + resource: True for resource in access_control.RESOURCES})
+        full["scope:" + OTHER] = True
+
+        with patch.object(user_auth, "authenticate", side_effect=authenticate), patch.object(
+            super_admin, "auth", side_effect=auth
+        ), patch.object(super_admin.cloud, "_request", side_effect=save), patch.object(
+            access_control, "managed_admin_active", return_value=True
+        ), patch.object(super_admin, "list_accounts", side_effect=lambda: [super_admin.account(x) for x in people.values()]):
+            actor_provider = None
+            self.assertEqual(self.client.patch(endpoint + OWNER, headers=HEADERS,
+                json={"permissions": partial}).status_code, 200)
+            actor_provider = actor
+            listing = self.client.get("/api/super-admin/role-accounts")
+            self.assertEqual([row["id"] for row in listing.json()["accounts"]], [OTHER])
+            self.assertEqual(self.client.patch(endpoint + OTHER, headers=HEADERS,
+                json={"role": "admin"}).status_code, 403)
+            self.assertEqual(self.client.patch(endpoint + OTHER, headers=HEADERS,
+                json={"permissions": {"roles.edit": True}}).status_code, 403)
+            self.assertEqual(self.client.patch(endpoint + OTHER, headers=HEADERS,
+                json={"permissions": {"bases.add": False}}).status_code, 200)
+
+            actor_provider = None
+            self.assertEqual(self.client.patch(endpoint + OWNER, headers=HEADERS,
+                json={"permissions": full}).status_code, 200)
+            actor_provider = actor
+            self.assertEqual(self.client.get("/api/auth/session").json()["user"]["role"], "user")
+            for owner in (OWNER, third, admin_sessions.SUPER_ID):
+                self.assertEqual(self.client.patch(endpoint + owner, headers=HEADERS,
+                    json={"role": "admin"}).status_code, 403)
+            for new_role in ("admin", "user"):
+                result = self.client.patch(endpoint + OTHER, headers=HEADERS, json={"role": new_role})
+                self.assertEqual(result.status_code, 200, result.text)
+                self.assertEqual(result.json()["role"], new_role)
+            self.assertEqual(self.client.patch(endpoint + OTHER, headers=HEADERS,
+                json={"permissions": {"scope:" + OWNER: True}}).status_code, 403)
+            self.assertEqual(self.client.put("/api/super-admin/roles/admin", headers=HEADERS,
+                json={"active": False}).status_code, 403)
+
+            actor_provider = None
+            self.assertEqual(self.client.patch(endpoint + OWNER, headers=HEADERS,
+                json={"permissions": {**full, "module:roles": False}}).status_code, 200)
+            actor_provider = actor
+            self.assertEqual(self.client.get("/api/super-admin/role-accounts").status_code, 403)
+            self.assertEqual(self.client.patch(endpoint + OTHER, headers=HEADERS,
+                json={"role": "admin"}).status_code, 403)
+            events = self.client.get("/api/super-admin/activity-logs/role-management").json()["events"]
+            self.assertEqual(sum(row["actor_id"] == OWNER and row["action"] == "Changed account role"
+                                 for row in events), 2)
+
+    def test_super_admin_denial_supersedes_a_delegated_override_and_legacy_direct_upload(self):
+        from rag import admin_panel, security_store
+        identity = {"id": OWNER, "app_metadata": {"qa_access": {
+            "permissions": {"user_uploads.add": True, "bases.add": True},
+            "delegated_overrides": ["user_uploads.add", "bases.add"],
+        }}}
+        async def authenticate(request):
+            request.state.user = await user_auth.active_profile(identity)
+
+        with patch.object(user_auth, "authenticate", side_effect=authenticate), patch.object(
+            admin_panel, "policy", return_value="allowed"
+        ), patch.object(admin_panel.cloud, "rows", return_value=[]):
+            session = self.client.get("/api/auth/session").json()["user"]
+            self.assertTrue(session["permissions"]["bases.add"])
+            self.assertEqual(self.client.get("/api/upload-requests").json()["policy"], "allowed")
+            self.assertTrue(security_store.write("policy:user", {
+                "modules": {"user_uploads": True},
+                "actions": {"user_uploads.add": False, "bases.add": False},
+            }, 0))
+            session = self.client.get("/api/auth/session").json()["user"]
+            self.assertFalse(session["permissions"]["bases.add"])
+            self.assertFalse(session["permissions"]["user_uploads.add"])
+            self.assertEqual(self.client.get("/api/upload-requests").json()["policy"], "approval_required")
 
     def test_enabled_user_can_review_other_uploads_but_not_their_own(self):
         async def authenticate(request):
@@ -174,7 +575,7 @@ class SuperAdminTests(unittest.TestCase):
         remove = "/api/admin/upload-requests/" + OTHER
         self.assertEqual(self.client.get(add, headers=HEADERS).status_code, 403)
         self.assertEqual(self.client.delete(remove, headers=HEADERS).status_code, 403)
-        security_store.write("account:local-admin", {"approvals.add": True, "approvals.delete": True}, 0)
+        security_store.write("account:local-admin", {"approvals.add": True, "approvals.delete": True, "scope:role:user": True}, 0)
 
         def save(*args, **options):
             self.assertEqual(workspace.owner_id(), OWNER)
@@ -200,7 +601,7 @@ class SuperAdminTests(unittest.TestCase):
         policy = {"modules": {"bases": False}, "actions": {"documents.edit": False}, "revision": 0}
         self.assertEqual(self.client.put(endpoint + "/user", headers=HEADERS, json=policy).status_code, 200)
         self.assertEqual(self.client.put(endpoint + "/user", headers=HEADERS, json=policy).status_code, 409)
-        self.assertEqual(self.client.put(endpoint + "/admin", headers=HEADERS, json={**policy, "modules": {"roles": True}}).status_code, 400)
+        self.assertEqual(self.client.put(endpoint + "/admin", headers=HEADERS, json={**policy, "modules": {"unknown": True}}).status_code, 400)
         with patch.object(super_admin, "list_accounts", return_value=[]):
             self.assertEqual(self.client.get(endpoint).json()["policies"]["user"], {**policy, "revision": 1})
         logs = self.client.get("/api/super-admin/login-logs").json()["events"]
@@ -281,7 +682,7 @@ class SuperAdminTests(unittest.TestCase):
 
     def test_cloud_revision_reverse_uses_transaction_rpc_and_local_audit_view(self):
         self.sign_in_super()
-        with patch("rag.revisions.cloud._request") as rpc:
+        with patch("rag.revisions.lookup", return_value=None), patch("rag.revisions.cloud._request") as rpc:
             rpc.return_value.json.return_value = {"id": 52, "category": "user-details", "target": OWNER}
             response = self.client.post("/api/super-admin/revisions/RV-C000051/reverse", headers=HEADERS)
             self.assertEqual(response.json(), {"revision_id": "RV-C000052"})
@@ -316,7 +717,8 @@ class SuperAdminTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 403)
 
     def test_admin_role_management_stays_protected(self):
-        self.assertFalse(access_control.available("admin", "roles.edit"))
+        self.assertTrue(access_control.available("admin", "roles.edit"))
+        self.assertFalse(access_control.defaults("admin")["roles.edit"])
         self.sign_in_super()
         with patch.object(super_admin, "auth") as provider:
             response = self.client.patch("/api/super-admin/accounts/" + admin_sessions.SUPER_ID,
@@ -398,7 +800,7 @@ class SuperAdminTests(unittest.TestCase):
                                       json={**data, "password": "test-password"})
         self.assertEqual(result.status_code, 201)
         self.assertEqual(auth.call_args.kwargs["json"]["app_metadata"]["qa_access"],
-                         {"role": "user", "permissions": {"bases.add": False}})
+                         {"role": "user", "permissions": {"bases.add": False}, "created_by": admin_sessions.SUPER_ID})
 
         with patch("rag.super_admin.cloud._request"), patch.object(
             super_admin, "auth", return_value={**user, "hashed_token": "test-invite-token"},
@@ -408,7 +810,8 @@ class SuperAdminTests(unittest.TestCase):
             result = self.client.post("/api/super-admin/accounts", headers=HEADERS, json={**data, "method": "invite"})
         self.assertEqual(result.status_code, 201)
         self.assertEqual(result.json()["invite_token"], user_auth.sign_invite("test-invite-token"))
-        self.assertEqual(update.call_args.kwargs, {"role": "user", "invited": True, "permissions": {"bases.add": False}})
+        self.assertEqual({key: value for key, value in update.call_args.kwargs.items() if key != "revision_request"},
+                         {"role": "user", "invited": True, "permissions": {"bases.add": False}})
         self.assertEqual(auth.call_args.kwargs["endpoint"], "/admin/generate_link")
         self.assertNotIn("password", auth.call_args.kwargs["json"])
 

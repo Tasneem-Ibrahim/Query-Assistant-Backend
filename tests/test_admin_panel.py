@@ -54,7 +54,8 @@ class ApprovalTests(unittest.TestCase):
     def test_policy_change_blocks_even_approved_uploads(self):
         self.prepare()
         self.storage.tables['qa_upload_requests'][0]['status'] = 'approved'
-        response = self.req('admin', 'PUT', '/admin/users/' + ALICE['id'] + '/permissions', json={'policy': 'blocked'})
+        with patch('rag.super_admin.auth', return_value=ALICE), patch('rag.super_admin.require_target'):
+            response = self.req('admin', 'PUT', '/admin/users/' + ALICE['id'] + '/permissions', json={'policy': 'blocked'})
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.req('alice', 'POST', f'/domains/{self.key}/ingest', files={'file': ('private.pdf', self.pdf)}).status_code, 403)
         response = self.req('alice', 'POST', '/upload-requests', json={k: self.row[k] for k in ['domain', 'filename', 'file_hash', 'size']})

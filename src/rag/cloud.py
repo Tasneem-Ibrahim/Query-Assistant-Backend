@@ -14,6 +14,10 @@ import pymupdf
 from . import config, workspace
 
 
+class DelegationConflict(RuntimeError):
+    """A permission snapshot became stale at the database write."""
+
+
 class CloudStorageError(RuntimeError):
     """Safe public message for a failed storage dependency."""
 
@@ -34,6 +38,8 @@ def _request(method, path, **kwargs):
         response = _client.request(method, config.SUPABASE_URL + path, headers=headers, **kwargs)
     except httpx.HTTPError as exc:
         raise CloudStorageError("Cannot reach Supabase. Check the backend connection and SUPABASE_URL, then retry.") from exc
+    if response.status_code == 409 and "X-QA-Delegation" in headers:
+        raise DelegationConflict("Permission settings changed. Refresh and try again.")
     if not response.is_success:
         # Never pass provider bodies/URLs (which can contain credentials) to browsers.
         raise CloudStorageError(f"Supabase request failed (HTTP {response.status_code}). Check the SQL setup, private bucket and service-role key.")

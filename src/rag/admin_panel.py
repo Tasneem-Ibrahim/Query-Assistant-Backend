@@ -20,11 +20,6 @@ router = APIRouter(prefix="/api", tags=["Administration"])
 POLICIES = {"approval_required", "allowed", "blocked"}
 
 
-def admin(request):
-    if request.state.user.get("role") not in {"admin", "super_admin"}:
-        raise HTTPException(403, "Administrator access required.")
-
-
 def uid(value):
     try:
         return str(UUID(value))
@@ -37,13 +32,19 @@ def policy(owner):
     return rows[0]["policy"] if rows else "approval_required"
 
 
-def upload_mode(owner, direct_upload=False):
+def upload_mode(owner, direct_upload=None):
     mode = policy(owner)
+    if direct_upload is False and mode == "allowed":
+        return "approval_required"
     return "allowed" if direct_upload and mode == "approval_required" else mode
 
 
-def require_upload(key, filename, content, *, direct_upload=False):
-    if workspace.owner_id() == "admin" or workspace.privileged_actor():
+def require_upload(key, filename, content, *, direct_upload=None):
+    if workspace.privileged_actor():
+        return
+    if workspace.owner_id() == "admin":
+        if direct_upload is False:
+            raise HTTPException(403, "Direct uploads are disabled for this account.")
         return
     owner = workspace.owner_id()
     managed = cloud.rows('qa_upload_requests',user_id='eq.'+owner,domain='eq.'+key,
@@ -90,7 +91,6 @@ def users(request: Request):
 
 @router.get("/admin/users/{owner}/activity")
 def user_activity(request: Request, owner: str):
-    admin(request)
     owner = uid(owner)
     from . import domains, ingest
     from .extract import IMAGE_EXTENSIONS
@@ -153,13 +153,20 @@ class PermissionBody(BaseModel):
 
 @router.put("/admin/users/{user_id}/permissions")
 def permissions(user_id: str, body: PermissionBody, request: Request):
-    admin(request)
     from .revisions import actor_header
+    from .access_control import allows
+    actor = request.state.user
+    if body.policy == "allowed" and not allows(actor, "user_uploads.add"):
+        raise HTTPException(403, "Granting direct upload access requires User uploads permission.")
     user_id = uid(user_id)
     if body.policy not in POLICIES:
         raise HTTPException(400, "Invalid upload policy.")
     if not cloud.rows("users", id="eq." + user_id):
         raise HTTPException(404, "User not found.")
+    if actor["role"] != "super_admin":
+        from . import super_admin
+        person = super_admin.account(super_admin.auth("GET", "/" + user_id))
+        super_admin.require_target(actor, person)
     cloud.write("qa_upload_permissions", {"user_id": user_id, "policy": body.policy}, "user_id", headers=actor_header(request))
     return {"policy": body.policy}
 
@@ -256,11 +263,12 @@ class Decision(BaseModel):
 
 
 @contextmanager
-def approval_workspace(owner):
+def approval_workspace(owner, actor):
     from . import super_admin
     person = super_admin.account(super_admin.auth("GET", "/" + uid(owner)))
-    if person["role"] != "user" or person["status"] != "active":
-        raise HTTPException(403, "Select an active User account.")
+    super_admin.require_target(actor, person)
+    if person["status"] != "active":
+        raise HTTPException(403, "Select an active account.")
     if not workspace.begin_write(person["id"]):
         raise HTTPException(409, "This workspace is being deleted.")
     token = workspace.bind(person)
@@ -273,22 +281,20 @@ def approval_workspace(owner):
 
 @router.get("/admin/upload-requests/for/{owner}")
 def approval_bases(owner: str, request: Request):
-    admin(request)
     from .domains import list_domains
-    with approval_workspace(owner):
+    with approval_workspace(owner, request.state.user):
         return [{"key": domain.key, "label": domain.label} for domain in list_domains()]
 
 
 @router.post("/admin/upload-requests/for/{owner}", status_code=201)
 async def add_approval_request(owner: str, request: Request, domain: str = Form(...),
                                file: UploadFile = File(...), message: str = Form(default="", max_length=500)):
-    admin(request)
     from .domains import get_domain
     from .saved_uploads import save
     content = await file.read(config.MAX_UPLOAD_BYTES + 1)
 
     def add():
-        with approval_workspace(owner):
+        with approval_workspace(owner, request.state.user):
             try:
                 selected = get_domain(domain)
             except ValueError:
@@ -300,7 +306,6 @@ async def add_approval_request(owner: str, request: Request, domain: str = Form(
 
 @router.delete("/admin/upload-requests/{request_id}")
 def delete_approval_request(request_id: str, request: Request):
-    admin(request)
     request_id = uid(request_id)
     now = datetime.now(timezone.utc).isoformat()
     changed = cloud._request("PATCH", "/rest/v1/qa_upload_requests", params={
@@ -326,7 +331,7 @@ def decide(request_id: str, body: Decision, request: Request):
     actor = request.state.user
     if not allows(actor, "approvals.edit"):
         raise HTTPException(403, "Upload approval access required.")
-    if actor["role"] == "user" and cloud.rows(
+    if actor["role"] != "super_admin" and actor["id"] != "local-admin" and cloud.rows(
         "qa_upload_requests", id="eq." + request_id, user_id="eq." + actor["id"], select="id",
     ):
         raise HTTPException(403, "You cannot review your own upload request.")

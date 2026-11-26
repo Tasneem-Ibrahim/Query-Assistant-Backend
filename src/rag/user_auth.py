@@ -104,6 +104,7 @@ def profile(user):
     super_admin = user.get("_local_super_admin") is True
     role = "super_admin" if super_admin else "admin" if local_admin or access.get("role") == "admin" else "user"
     return {"id": user["id"], "email": user.get("email", ""),
+            "delegated_overrides": access.get("delegated_overrides", []),
             "name": user.get("user_metadata", {}).get("name") or user.get("email", "User"),
             "role": role, "permissions": access.get("permissions", {}),
             "onboarding_seen": role != "user" or user.get("user_metadata", {}).get("workspace_guide_seen") is True}
@@ -133,12 +134,28 @@ async def active_profile(user):
         if not await run_in_threadpool(access_control.managed_admin_active):
             raise HTTPException(403, "The Admin role is inactive. Contact Super Admin.")
     if account["role"] != "super_admin":
-        account["permissions"] = await run_in_threadpool(access_control.effective, account)
+        settings, _ = await run_in_threadpool(access_control.policy, account["role"])
+        overrides = account["permissions"]
+        if account["id"] == "local-admin":
+            overrides, _ = await run_in_threadpool(access_control.original_admin_permissions)
+        account["permissions"] = await run_in_threadpool(access_control.effective, account, settings,
+                                                         account_overrides=overrides)
+        account["account_scope"] = access_control.scope_entries(overrides)
+        modules, actions = settings.get("modules", {}), settings.get("actions", {})
+        account["direct_upload_restricted"] = (
+            modules.get("user_uploads") is False
+            or overrides.get("module:user_uploads") is False
+            or overrides.get("user_uploads.add", actions.get("user_uploads.add")) is False
+            or "user_uploads.add" in account["delegated_overrides"]
+            and actions.get("user_uploads.add") is False
+            and "user_uploads.add" not in settings.get("delegated_actions", ())
+        )
     if account["id"] == "local-admin":
         status, _ = await run_in_threadpool(access_control.original_admin_status)
         if status.get("active") is False:
             account["access_suspended"] = True
             account["permissions"] = dict.fromkeys(account["permissions"], False)
+    account.pop("delegated_overrides", None)
     return account
 
 

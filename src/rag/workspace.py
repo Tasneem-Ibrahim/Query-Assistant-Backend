@@ -12,7 +12,7 @@ import re
 _actor = ContextVar("workspace_actor", default="")
 
 def bind_actor(user):
-    return _actor.set(user["role"])
+    return _actor.set(user["role"] == "super_admin")
 
 
 def reset_actor(token):
@@ -20,7 +20,7 @@ def reset_actor(token):
 
 
 def privileged_actor():
-    return _actor.get() in {"admin", "super_admin"}
+    return _actor.get() is True
 
 
 _owner = ContextVar("workspace_owner", default="admin")
