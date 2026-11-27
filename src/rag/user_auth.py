@@ -10,7 +10,7 @@ import time
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, Response
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, ValidationError, field_validator
 
 from starlette.concurrency import run_in_threadpool
 
@@ -104,6 +104,8 @@ def profile(user):
     super_admin = user.get("_local_super_admin") is True
     role = "super_admin" if super_admin else "admin" if local_admin or access.get("role") == "admin" else "user"
     return {"id": user["id"], "email": user.get("email", ""),
+            "created_at": user.get("created_at"),
+            "email_verified": bool(user.get("email_confirmed_at")),
             "delegated_overrides": access.get("delegated_overrides", []),
             "name": user.get("user_metadata", {}).get("name") or user.get("email", "User"),
             "role": role, "permissions": access.get("permissions", {}),
@@ -375,6 +377,77 @@ async def accept_invite(body: AcceptInviteBody, response: Response):
 @router.get("/session")
 async def session(request: Request):
     return {"user": request.state.user}
+
+
+class AccountNameBody(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, value):
+        return SignupBody.name_valid(value)
+
+
+class AccountPasswordBody(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=8, max_length=256)
+
+
+def self_service_account(request):
+    account = request.state.user
+    if account["role"] != "user":
+        raise HTTPException(403, "My Account is available to User accounts.")
+    return account
+
+
+@router.get("/account")
+async def account_details(request: Request):
+    account = self_service_account(request)
+    factor, _ = await run_in_threadpool(security_store.read, "factor:" + account["id"])
+    return {"mfa_enabled": factor.get("enrolled") is True}
+
+
+@router.patch("/account")
+async def update_account(body: AccountNameBody, request: Request):
+    self_service_account(request)
+    user = await provider("PUT", "/user", token=request.cookies[ACCESS],
+                          body={"data": {"name": body.name}})
+    return {"name": profile(user)["name"]}
+
+
+@router.post("/account/password")
+async def update_account_password(request: Request):
+    account = self_service_account(request)
+    try:
+        body = AccountPasswordBody.model_validate_json(await request.body())
+    except ValidationError:
+        raise HTTPException(422, "Enter your current password and a new password of 8 to 256 characters.") from None
+    if body.current_password == body.new_password:
+        raise HTTPException(400, "Choose a password different from your current password.")
+    try:
+        verified = await provider("POST", "/token?grant_type=password",
+                                  body={"email": account["email"], "password": body.current_password})
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            raise HTTPException(400, "Current password is incorrect.") from None
+        raise
+    token = verified["access_token"]
+    try:
+        if verified["user"]["id"] != account["id"]:
+            raise HTTPException(403, "Could not verify this account.")
+        try:
+            await provider("PUT", "/user", token=token, body={"password": body.new_password})
+        except HTTPException as exc:
+            if exc.status_code == 401:
+                raise HTTPException(400, "The authentication service rejected the new password.") from None
+            raise
+    finally:
+        try:
+            await provider("POST", "/logout?scope=local", token=token)
+        except HTTPException:
+            # The verification session was never sent to the browser.
+            pass
+    return {"ok": True}
 
 
 @router.post("/onboarding/complete")

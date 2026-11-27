@@ -58,7 +58,7 @@ class UserAuthTests(unittest.TestCase):
             if self.fail_network:
                 raise httpx.ConnectError('private diagnostic')
             if url.endswith('/user'):
-                if method == 'PUT':
+                if method == 'PUT' and 'data' in kwargs['json']:
                     self.user['user_metadata'].update(kwargs['json']['data'])
                 return httpx.Response(200, json=self.user)
             if '/logout?' in url:
@@ -93,6 +93,42 @@ class UserAuthTests(unittest.TestCase):
         signup = self.provider_calls[0]
         self.assertEqual(signup[2]['json']['data'], {'name': 'Test Person'})
         self.assertEqual(self.client.get('/api/auth/session').json()['user']['id'], USER['id'])
+
+    def test_self_service_account_is_authenticated_and_updates_only_the_signed_in_user(self):
+        self.assertEqual(self.client.get('/api/auth/account').status_code, 401)
+        self.assertEqual(self.login().status_code, 200)
+        self.assertEqual(self.client.get('/api/auth/account').json(), {'mfa_enabled': True})
+        self.assertEqual(self.client.patch('/api/auth/account', json={'name': 'New Name'}).status_code, 403)
+        response = self.client.patch('/api/auth/account', headers=CSRF, json={
+            'name': ' New Name ', 'id': 'other-account', 'role': 'admin',
+        })
+        self.assertEqual(response.json(), {'name': 'New Name'})
+        self.assertEqual(self.provider_calls[-1][2]['json'], {'data': {'name': 'New Name'}})
+        self.assertEqual(self.client.get('/api/auth/session').json()['user']['role'], 'user')
+        self.user['app_metadata'] = {'qa_access': {'role': 'admin'}}
+        with patch.object(access_control, 'managed_admin_active', return_value=True):
+            self.assertEqual(self.client.get('/api/auth/account').status_code, 403)
+
+    def test_account_password_change_rechecks_password_and_revokes_verification_session(self):
+        self.assertEqual(self.login().status_code, 200)
+        path = '/api/auth/account/password'
+        body = {'current_password': 'test-password', 'new_password': 'new-test-password'}
+        invalid = self.client.post(path, headers=CSRF, json={**body, 'new_password': 'short'})
+        self.assertEqual(invalid.status_code, 422)
+        self.assertNotIn(body['current_password'], invalid.text)
+        self.fail_login = True
+        refused = self.client.post(path, headers=CSRF, json=body)
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn('Current password is incorrect', refused.text)
+        self.fail_login = False
+        response = self.client.post(path, headers=CSRF, json=body)
+        self.assertEqual(response.json(), {'ok': True})
+        verify, update, revoke = self.provider_calls[-3:]
+        self.assertEqual(verify[2]['json'], {'email': USER['email'], 'password': body['current_password']})
+        self.assertEqual(update[2]['json'], {'password': body['new_password']})
+        self.assertTrue(revoke[1].endswith('/logout?scope=local'))
+        self.assertEqual(update[2]['headers']['Authorization'], revoke[2]['headers']['Authorization'])
+        self.assertFalse(response.headers.get_list('set-cookie'))
 
     def test_cookies_http_only_and_access_lasts_15_minutes(self):
         response = self.login()
